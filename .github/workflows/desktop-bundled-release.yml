@@ -253,12 +253,19 @@ jobs:
       # upload.
       - name: Build and package
         shell: bash
-        timeout-minutes: 60
+        # macOS notarization dominates this step: Apple scans every Mach-O
+        # in the bundled python payload, and the first submission of a new
+        # binary set can wait a long time in the queue. Give the step all
+        # the headroom the 90-minute job allows.
+        timeout-minutes: 85
         env:
           npm_config_loglevel: 'verbose'
           # builder-util logs the exact signtool/dlib command lines and full
-          # child output — the only visibility into a signing hang.
-          DEBUG: 'electron-builder'
+          # child output — the only visibility into a signing hang. The
+          # electron-osx-sign and electron-notarize namespaces cover the
+          # two phases that were silent for 55 minutes before the darwin
+          # timeouts: per-file codesign and the notarytool submission.
+          DEBUG: 'electron-builder,electron-osx-sign*,electron-notarize*'
           HERMES_BUNDLE_TAG: ${{ env.HERMES_PAYLOAD_TAG }}
           # macOS signing and notarization (electron-builder builtin).
           # APPLE_API_KEY is intentionally NOT set here: the write-key
