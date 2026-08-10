@@ -635,6 +635,10 @@ Gateway 平台有实际的消息长度限制。如果 `/kanban list`、`/kanban 
 
 每种模式的详细示例，请参阅 `docs/hermes-kanban-v1-spec.pdf`。
 
+### 调解冲突的 worker 分支
+
+在工程流水线（使用 worktree 的 P1/P2）中，两个 worker 的分支合并时可能发生冲突。不要让任一 worker 自行裁决 —— 发生冲突的 agent 缺乏对方的上下文，往往会覆盖对方的改动或放弃自己的改动。正确做法是：创建一张调解卡片，指派给**第三个中立配置文件**，并把**两张**冲突卡片都链接为其父任务：父任务链接会把双方的完成摘要带入调解者的上下文，使其同时获得双方的 diff *和*双方的意图。内置的 [`merge-reconciler` 技能](https://github.com/NousResearch/hermes-agent/blob/main/skills/autonomous-ai-agents/merge-reconciler/SKILL.md) 为该 worker 提供完整流程：对每个冲突块分类、公正地解决、验证，并在交回摘要中说明每一项决定。
+
 ## 多租户使用
 
 当一个专家团队为多个业务提供服务时，为每个任务添加租户标签：
