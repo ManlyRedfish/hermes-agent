@@ -137,7 +137,6 @@ class ObservationService:
         self.port = int(port or os.environ.get("HERMES_OBSERVATION_PORT", "8643"))
         self._key_override = observation_key
         self._target_url_override = target_url
-        
         if generic_key_fingerprint is not None:
             self._generic_key_fingerprint = generic_key_fingerprint.strip()
         elif api_server_key is not None:

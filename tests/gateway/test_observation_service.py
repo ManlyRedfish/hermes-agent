@@ -1074,4 +1074,3 @@ async def test_production_target_url_default(monkeypatch):
     monkeypatch.setenv("HERMES_OBSERVATION_TARGET_URL", "http://attacker.example.com/health")
     service = ObservationService()
     assert service.get_target_url() == "http://127.0.0.1:8080/health"
-
