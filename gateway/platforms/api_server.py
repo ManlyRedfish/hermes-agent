@@ -1812,13 +1812,18 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            # Compare as bytes: ``hmac.compare_digest`` raises TypeError on a
-            # str containing non-ASCII characters, and ``token`` is the raw
-            # client-supplied header. A stray non-ASCII byte in the key would
-            # otherwise crash this handler (500) instead of returning a clean
-            # 401. Encoding both sides keeps the timing-safe comparison and
-            # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), expected_key.encode()):
+            obs_key = os.environ.get("HERMES_OBSERVATION_KEY", "").strip()
+            if obs_key and hmac.compare_digest(token.encode(), obs_key.encode()) and obs_key != expected_key:
+                logger.warning("API server rejected observation key on generic listener")
+                if web is not None:
+                    return web.json_response(
+                        {"error": {"message": "Invalid gateway API key (API_SERVER_KEY)", "type": "gateway_auth_error", "code": "gateway_auth_failed"}},
+                        status=401,
+                    )
+                class _Response:
+                    status = 401
+                return _Response()  # type: ignore
+            if expected_key and hmac.compare_digest(token.encode(), expected_key.encode()):
                 return None  # Auth OK
 
         logger.warning(

@@ -1,0 +1,48 @@
+[Unit]
+Description=Hermes Observation Service V1
+Documentation=file:///tmp/ai-country-observation-contract-v1.md
+After=network.target
+
+[Service]
+Type=simple
+User=hermes-observer
+Group=hermes-observer
+
+# Separate Environment & Credential File
+EnvironmentFile=/etc/hermes-observation/env
+# HERMES_OBSERVATION_KEY=obs-secret-token-here
+# HERMES_OBSERVATION_HOST=127.0.0.1
+# HERMES_OBSERVATION_PORT=8643
+# HERMES_OBSERVATION_TARGET_URL=http://127.0.0.1:8080/health
+
+ExecStart=/usr/bin/python3 -m gateway.observation_service
+
+Restart=on-failure
+RestartSec=5s
+
+# Process & Capabilities Restrictions
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+# Filesystem Restrictions
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/
+ReadWritePaths=/var/log/hermes-observation
+
+# Network Restrictions (Loopback egress only)
+IPAddressAllow=127.0.0.1/32 ::1/128
+IPAddressDeny=any
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
