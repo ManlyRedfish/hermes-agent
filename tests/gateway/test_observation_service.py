@@ -1724,3 +1724,122 @@ async def test_earlier_revoked_key_never_restores_authority_after_capacity_reach
     # Verify filler keys are invalid and authority fails closed
     assert service.is_key_valid("revoked-key-filler-0") is False
     assert service.is_key_valid(key_beta) is False
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_or_header_line_maps_to_400_invalid_request():
+    """Verify StreamReader line-limit overrun exceptions map to HTTP 400 invalid_request, never HTTP 500."""
+    port = get_free_port()
+    obs_key = "obs-key-overlimit-line-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+    )
+    await service.start()
+
+    try:
+        # 1. Oversized header line exceeding StreamReader limit (70,000 bytes > 64 KiB buffer)
+        oversized_header_val = b"A" * 70000
+        req_hdr = (
+            b"POST /v1/observation HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Authorization: Bearer obs-key-overlimit-line-123\r\n"
+            b"X-Oversized-Header: " + oversized_header_val + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 42\r\n\r\n"
+            b'{"action_id":"observe.ai_country.health"}'
+        )
+
+        status1, _, body1 = await raw_http_request("127.0.0.1", port, req_hdr)
+        assert status1 == 400
+        data1 = json.loads(body1.decode("utf-8"))
+        assert data1["error"]["code"] == "invalid_request"
+        assert status1 != 500
+
+        # 2. Oversized request line exceeding StreamReader limit (70,000 bytes > 64 KiB buffer)
+        oversized_path = b"/v1/observation?" + b"B" * 70000
+        req_line = (
+            b"POST " + oversized_path + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Authorization: Bearer obs-key-overlimit-line-123\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 42\r\n\r\n"
+            b'{"action_id":"observe.ai_country.health"}'
+        )
+
+        status2, _, body2 = await raw_http_request("127.0.0.1", port, req_line)
+        assert status2 == 400
+        data2 = json.loads(body2.decode("utf-8"))
+        assert data2["error"]["code"] == "invalid_request"
+        assert status2 != 500
+
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_revocation_lock_boundary_atomic_synchronization():
+    """Verify final authorization, open_connection, and establishment decision form one atomic authority boundary relative to revoke_key."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-atomic-boundary-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+
+    paused_at_preconnect = asyncio.Event()
+    release_preconnect = asyncio.Event()
+
+    async def _pre_connect_hook():
+        paused_at_preconnect.set()
+        await release_preconnect.wait()
+
+    service.pre_connect_hook = _pre_connect_hook
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        # Launch request in background task
+        req_task = asyncio.create_task(raw_http_request("127.0.0.1", port, req))
+
+        # Wait until request pauses immediately before atomic authority boundary
+        await asyncio.wait_for(paused_at_preconnect.wait(), timeout=2.0)
+
+        # Launch revocation task in background
+        revoke_task = asyncio.create_task(service.revoke_key(obs_key))
+
+        # Yield execution to allow revoke_task to attempt lock acquisition first
+        await asyncio.sleep(0.02)
+
+        # Unblock pre_connect_hook so request task proceeds to acquire authority lock
+        release_preconnect.set()
+
+        status, _, body = await req_task
+        await revoke_task
+
+        assert status == 401
+        assert json.loads(body)["error"]["code"] == "unauthorized"
+
+        # Prove zero target connections were established because revocation acquired authority lock first
+        assert target.get_count == 0
+        assert target.post_count == 0
+        assert service.audit_journal.entries[-1]["target_contact"] == "false"
+
+    finally:
+        await service.stop()
+        await target.stop()

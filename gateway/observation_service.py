@@ -274,195 +274,199 @@ class ObservationService:
         async def _read_and_parse_request() -> Tuple[int, bytes, str, Optional[str], Optional[Tuple[str, int, str]]]:
             nonlocal action_name
 
-            # Read request line
-            line = await reader.readline()
-            if not line:
-                return 400, b"", "unknown", None, None
-
             try:
-                request_line = line.decode("iso-8859-1").rstrip("\r\n")
-                parts = request_line.split(" ")
-                if len(parts) != 3:
-                    sc, rb = _json_error("invalid_request", "Invalid HTTP request line", 400)
-                    return sc, rb, "unknown", None, None
-                method, raw_target, http_version = parts
-            except Exception:
-                sc, rb = _json_error("invalid_request", "Invalid request line format", 400)
-                return sc, rb, "unknown", None, None
+                # Read request line
+                line = await reader.readline()
+                if not line:
+                    return 400, b"", "unknown", None, None
 
-            # Validate HTTP request version strictly against explicitly supported tokens
-            if http_version not in ("HTTP/1.1", "HTTP/1.0"):
-                sc, rb = _json_error("invalid_request", "Unsupported HTTP version", 400)
-                return sc, rb, "unknown", None, None
-
-            # Read headers line by line with maximum count and total byte bounds
-            headers: List[Tuple[str, str]] = []
-            raw_headers: List[Tuple[str, str, str]] = []
-            header_count = 0
-            header_bytes = 0
-            while True:
-                hline = await reader.readline()
-                if not hline:
-                    sc, rb = _json_error("invalid_request", "Incomplete headers", 400)
-                    return sc, rb, "unknown", None, None
-
-                header_bytes += len(hline)
-                if header_bytes > MAX_REQUEST_HEADER_BYTES:
-                    sc, rb = _json_error("invalid_request", "Header bytes limit exceeded", 400)
-                    return sc, rb, "unknown", None, None
-
-                if hline in (b"\r\n", b"\n"):
-                    break
-
-                header_count += 1
-                if header_count > MAX_REQUEST_HEADER_COUNT:
-                    sc, rb = _json_error("invalid_request", "Header count limit exceeded", 400)
-                    return sc, rb, "unknown", None, None
-
-                hstr = hline.decode("iso-8859-1").rstrip("\r\n")
-                if ":" not in hstr:
-                    sc, rb = _json_error("invalid_request", "Malformed header", 400)
-                    return sc, rb, "unknown", None, None
-                k, v = hstr.split(":", 1)
-                headers.append((k.strip(), v.strip()))
-                raw_headers.append((k.strip(), v, v.strip()))
-
-            # Check for forbidden override/proxy headers
-            for k, _ in headers:
-                kl = k.lower()
-                if kl in FORBIDDEN_HEADERS:
-                    if kl in ("x-http-method-override", "x-http-method", "x-method-override"):
-                        sc, rb = _json_error("method_not_allowed", "Method override forbidden", 405)
+                try:
+                    request_line = line.decode("iso-8859-1").rstrip("\r\n")
+                    parts = request_line.split(" ")
+                    if len(parts) != 3:
+                        sc, rb = _json_error("invalid_request", "Invalid HTTP request line", 400)
                         return sc, rb, "unknown", None, None
-                    else:
-                        sc, rb = _json_error("invalid_request", "Forbidden header", 400)
+                    method, raw_target, http_version = parts
+                except Exception:
+                    sc, rb = _json_error("invalid_request", "Invalid request line format", 400)
+                    return sc, rb, "unknown", None, None
+
+                # Validate HTTP request version strictly against explicitly supported tokens
+                if http_version not in ("HTTP/1.1", "HTTP/1.0"):
+                    sc, rb = _json_error("invalid_request", "Unsupported HTTP version", 400)
+                    return sc, rb, "unknown", None, None
+
+                # Read headers line by line with maximum count and total byte bounds
+                headers: List[Tuple[str, str]] = []
+                raw_headers: List[Tuple[str, str, str]] = []
+                header_count = 0
+                header_bytes = 0
+                while True:
+                    hline = await reader.readline()
+                    if not hline:
+                        sc, rb = _json_error("invalid_request", "Incomplete headers", 400)
                         return sc, rb, "unknown", None, None
 
-            # Check raw request target (must match origin-form octets exactly)
-            if raw_target not in ("/health", "/v1/observation"):
-                sc, rb = _json_error("not_found", "Not found", 404)
-                return sc, rb, "unknown", None, None
+                    header_bytes += len(hline)
+                    if header_bytes > MAX_REQUEST_HEADER_BYTES:
+                        sc, rb = _json_error("invalid_request", "Header bytes limit exceeded", 400)
+                        return sc, rb, "unknown", None, None
 
-            # Health liveness route: GET /health
-            if raw_target == "/health":
-                action_name = "observe.health"
-                if method != "GET":
+                    if hline in (b"\r\n", b"\n"):
+                        break
+
+                    header_count += 1
+                    if header_count > MAX_REQUEST_HEADER_COUNT:
+                        sc, rb = _json_error("invalid_request", "Header count limit exceeded", 400)
+                        return sc, rb, "unknown", None, None
+
+                    hstr = hline.decode("iso-8859-1").rstrip("\r\n")
+                    if ":" not in hstr:
+                        sc, rb = _json_error("invalid_request", "Malformed header", 400)
+                        return sc, rb, "unknown", None, None
+                    k, v = hstr.split(":", 1)
+                    headers.append((k.strip(), v.strip()))
+                    raw_headers.append((k.strip(), v, v.strip()))
+
+                # Check for forbidden override/proxy headers
+                for k, _ in headers:
+                    kl = k.lower()
+                    if kl in FORBIDDEN_HEADERS:
+                        if kl in ("x-http-method-override", "x-http-method", "x-method-override"):
+                            sc, rb = _json_error("method_not_allowed", "Method override forbidden", 405)
+                            return sc, rb, "unknown", None, None
+                        else:
+                            sc, rb = _json_error("invalid_request", "Forbidden header", 400)
+                            return sc, rb, "unknown", None, None
+
+                # Check raw request target (must match origin-form octets exactly)
+                if raw_target not in ("/health", "/v1/observation"):
+                    sc, rb = _json_error("not_found", "Not found", 404)
+                    return sc, rb, "unknown", None, None
+
+                # Health liveness route: GET /health
+                if raw_target == "/health":
+                    action_name = "observe.health"
+                    if method != "GET":
+                        sc, rb = _json_error("method_not_allowed", "Method not allowed", 405)
+                        return sc, rb, action_name, None, None
+                    return 200, b'{"status":"ok"}', action_name, None, None
+
+                # Observation action route: POST /v1/observation
+                action_name = ACTION_ID_HEALTH
+                if method != "POST":
                     sc, rb = _json_error("method_not_allowed", "Method not allowed", 405)
                     return sc, rb, action_name, None, None
-                return 200, b'{"status":"ok"}', action_name, None, None
 
-            # Observation action route: POST /v1/observation
-            action_name = ACTION_ID_HEALTH
-            if method != "POST":
-                sc, rb = _json_error("method_not_allowed", "Method not allowed", 405)
-                return sc, rb, action_name, None, None
-
-            # 1. AUTHENTICATION CHECK (performed before body parsing/target contact)
-            raw_auth_entries = [r for r in raw_headers if r[0].lower() == "authorization"]
-            if len(raw_auth_entries) != 1:
-                sc, rb = _json_error("unauthorized", "Unauthorized", 401)
-                return sc, rb, action_name, None, None
-
-            raw_val = raw_auth_entries[0][1]
-            if raw_val.endswith(" ") or raw_val.endswith("\t"):
-                sc, rb = _json_error("unauthorized", "Unauthorized", 401)
-                return sc, rb, action_name, None, None
-
-            val = raw_val[1:] if raw_val.startswith(" ") else raw_val
-            if not val.startswith("Bearer "):
-                sc, rb = _json_error("unauthorized", "Unauthorized", 401)
-                return sc, rb, action_name, None, None
-
-            token = val[7:]
-            if not token or token != token.strip() or token.startswith(" ") or token.endswith(" ") or "\t" in token:
-                sc, rb = _json_error("unauthorized", "Unauthorized", 401)
-                return sc, rb, action_name, None, None
-
-            # Verify observation key configuration & separation
-            config_ok, msg = self.check_key_configuration()
-            if not config_ok:
-                sc, rb = _json_error("observation_disabled", msg, 503)
-                return sc, rb, action_name, None, None
-
-            # Verify token equality and revocation status
-            async with self._authority_lock:
-                if not self.is_key_valid(token):
+                # 1. AUTHENTICATION CHECK (performed before body parsing/target contact)
+                raw_auth_entries = [r for r in raw_headers if r[0].lower() == "authorization"]
+                if len(raw_auth_entries) != 1:
                     sc, rb = _json_error("unauthorized", "Unauthorized", 401)
                     return sc, rb, action_name, None, None
 
-            # 2. Reject ambiguous framing (both Transfer-Encoding and Content-Length)
-            te_headers = [v for k, v in headers if k.lower() == "transfer-encoding"]
-            cl_headers = [v for k, v in headers if k.lower() == "content-length"]
-            if te_headers and cl_headers:
-                sc, rb = _json_error("invalid_request", "Ambiguous framing: both Transfer-Encoding and Content-Length present", 400)
-                return sc, rb, action_name, None, None
-            if te_headers:
-                sc, rb = _json_error("invalid_request", "Transfer-Encoding not supported", 400)
-                return sc, rb, action_name, None, None
-
-            # 3. Content-Type check (application/json with no parameters or surrounding whitespace)
-            ct_entries = [r for r in raw_headers if r[0].lower() == "content-type"]
-            if len(ct_entries) != 1:
-                sc, rb = _json_error("invalid_request", "Invalid Content-Type header", 400)
-                return sc, rb, action_name, None, None
-
-            _k, raw_v, stripped_v = ct_entries[0]
-            media_type_raw = raw_v[1:] if raw_v.startswith(" ") else raw_v
-            if media_type_raw != media_type_raw.strip() or stripped_v.lower() != "application/json":
-                sc, rb = _json_error(
-                    "invalid_request", "Content-Type must be application/json with no parameters or surrounding whitespace", 400
-                )
-                return sc, rb, action_name, None, None
-
-            # 4. Content-Length & Body size cap (enforced before buffering entire body)
-            if len(cl_headers) != 1:
-                sc, rb = _json_error("invalid_request", "Content-Length required", 400)
-                return sc, rb, action_name, None, None
-            try:
-                cl = int(cl_headers[0])
-                if cl < 0:
-                    raise ValueError
-                if cl > MAX_BODY_BYTES:
-                    sc, rb = _json_error("request_too_large", "Payload too large", 413)
+                raw_val = raw_auth_entries[0][1]
+                if raw_val.endswith(" ") or raw_val.endswith("\t"):
+                    sc, rb = _json_error("unauthorized", "Unauthorized", 401)
                     return sc, rb, action_name, None, None
-            except ValueError:
-                sc, rb = _json_error("invalid_request", "Invalid Content-Length", 400)
-                return sc, rb, action_name, None, None
 
-            try:
-                body_bytes = await reader.readexactly(cl)
-            except asyncio.IncompleteReadError:
-                sc, rb = _json_error("invalid_request", "Incomplete request body", 400)
-                return sc, rb, action_name, None, None
+                val = raw_val[1:] if raw_val.startswith(" ") else raw_val
+                if not val.startswith("Bearer "):
+                    sc, rb = _json_error("unauthorized", "Unauthorized", 401)
+                    return sc, rb, action_name, None, None
 
-            if not body_bytes:
-                sc, rb = _json_error("invalid_request", "Empty request body", 400)
-                return sc, rb, action_name, None, None
+                token = val[7:]
+                if not token or token != token.strip() or token.startswith(" ") or token.endswith(" ") or "\t" in token:
+                    sc, rb = _json_error("unauthorized", "Unauthorized", 401)
+                    return sc, rb, action_name, None, None
 
-            # Parse JSON body with strict duplicate key rejection
-            try:
-                body_str = body_bytes.decode("utf-8")
-                data = _parse_json_no_duplicates(body_str)
-            except Exception:
-                sc, rb = _json_error("invalid_request", "Invalid JSON payload or duplicate keys", 400)
-                return sc, rb, action_name, None, None
+                # Verify observation key configuration & separation
+                config_ok, msg = self.check_key_configuration()
+                if not config_ok:
+                    sc, rb = _json_error("observation_disabled", msg, 503)
+                    return sc, rb, action_name, None, None
 
-            # Exact schema rules
-            if len(data) != 1 or "action_id" not in data or not isinstance(data["action_id"], str):
-                sc, rb = _json_error("invalid_request", "Body must contain exactly action_id field", 400)
-                return sc, rb, action_name, None, None
+                # Verify token equality and revocation status
+                async with self._authority_lock:
+                    if not self.is_key_valid(token):
+                        sc, rb = _json_error("unauthorized", "Unauthorized", 401)
+                        return sc, rb, action_name, None, None
 
-            if data["action_id"] != ACTION_ID_HEALTH:
-                sc, rb = _json_error("invalid_request", "Unsupported action", 400)
-                return sc, rb, action_name, None, None
+                # 2. Reject ambiguous framing (both Transfer-Encoding and Content-Length)
+                te_headers = [v for k, v in headers if k.lower() == "transfer-encoding"]
+                cl_headers = [v for k, v in headers if k.lower() == "content-length"]
+                if te_headers and cl_headers:
+                    sc, rb = _json_error("invalid_request", "Ambiguous framing: both Transfer-Encoding and Content-Length present", 400)
+                    return sc, rb, action_name, None, None
+                if te_headers:
+                    sc, rb = _json_error("invalid_request", "Transfer-Encoding not supported", 400)
+                    return sc, rb, action_name, None, None
 
-            # Target transport pre-validation
-            valid_target, thost, tport, tpath = self.validate_target_url()
-            if not valid_target:
-                sc, rb = _json_error("observation_disabled", "Observation target is not configured", 503)
-                return sc, rb, action_name, None, None
+                # 3. Content-Type check (application/json with no parameters or surrounding whitespace)
+                ct_entries = [r for r in raw_headers if r[0].lower() == "content-type"]
+                if len(ct_entries) != 1:
+                    sc, rb = _json_error("invalid_request", "Invalid Content-Type header", 400)
+                    return sc, rb, action_name, None, None
 
-            return 0, b"", action_name, token, (thost, tport, tpath)
+                _k, raw_v, stripped_v = ct_entries[0]
+                media_type_raw = raw_v[1:] if raw_v.startswith(" ") else raw_v
+                if media_type_raw != media_type_raw.strip() or stripped_v.lower() != "application/json":
+                    sc, rb = _json_error(
+                        "invalid_request", "Content-Type must be application/json with no parameters or surrounding whitespace", 400
+                    )
+                    return sc, rb, action_name, None, None
+
+                # 4. Content-Length & Body size cap (enforced before buffering entire body)
+                if len(cl_headers) != 1:
+                    sc, rb = _json_error("invalid_request", "Content-Length required", 400)
+                    return sc, rb, action_name, None, None
+                try:
+                    cl = int(cl_headers[0])
+                    if cl < 0:
+                        raise ValueError
+                    if cl > MAX_BODY_BYTES:
+                        sc, rb = _json_error("request_too_large", "Payload too large", 413)
+                        return sc, rb, action_name, None, None
+                except ValueError:
+                    sc, rb = _json_error("invalid_request", "Invalid Content-Length", 400)
+                    return sc, rb, action_name, None, None
+
+                try:
+                    body_bytes = await reader.readexactly(cl)
+                except asyncio.IncompleteReadError:
+                    sc, rb = _json_error("invalid_request", "Incomplete request body", 400)
+                    return sc, rb, action_name, None, None
+
+                if not body_bytes:
+                    sc, rb = _json_error("invalid_request", "Empty request body", 400)
+                    return sc, rb, action_name, None, None
+
+                # Parse JSON body with strict duplicate key rejection
+                try:
+                    body_str = body_bytes.decode("utf-8")
+                    data = _parse_json_no_duplicates(body_str)
+                except Exception:
+                    sc, rb = _json_error("invalid_request", "Invalid JSON payload or duplicate keys", 400)
+                    return sc, rb, action_name, None, None
+
+                # Exact schema rules
+                if len(data) != 1 or "action_id" not in data or not isinstance(data["action_id"], str):
+                    sc, rb = _json_error("invalid_request", "Body must contain exactly action_id field", 400)
+                    return sc, rb, action_name, None, None
+
+                if data["action_id"] != ACTION_ID_HEALTH:
+                    sc, rb = _json_error("invalid_request", "Unsupported action", 400)
+                    return sc, rb, action_name, None, None
+
+                # Target transport pre-validation
+                valid_target, thost, tport, tpath = self.validate_target_url()
+                if not valid_target:
+                    sc, rb = _json_error("observation_disabled", "Observation target is not configured", 503)
+                    return sc, rb, action_name, None, None
+
+                return 0, b"", action_name, token, (thost, tport, tpath)
+            except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, ValueError):
+                sc, rb = _json_error("invalid_request", "Request line or header limit exceeded", 400)
+                return sc, rb, action_name, None, None
 
         try:
             # 1. Hard aggregate deadline for receiving/parsing full request
@@ -479,36 +483,40 @@ class ObservationService:
                 action_name = "unknown"
                 status_code, response_body = _json_error("invalid_request", "Request receive timeout", 400)
                 return
+            except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, ValueError):
+                action_name = "unknown"
+                status_code, response_body = _json_error("invalid_request", "Request line or header limit exceeded", 400)
+                return
 
             if target_info is None or token is None:
                 return
 
             thost, tport, tpath = target_info
 
-            # Optional test/synchronization hook after authorization and before target connection start
+            # Optional test/synchronization hook immediately before target connection atomic authority boundary
             if self.pre_connect_hook is not None:
                 if asyncio.iscoroutinefunction(self.pre_connect_hook):
                     await self.pre_connect_hook()
                 else:
                     self.pre_connect_hook()
 
-            # Protect final revocation check and target connection start with authority lock/epoch
-            async with self._authority_lock:
-                epoch_at_start = self._authority_epoch
-                if not self.is_key_valid(token):
-                    status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
-                    return
-
             # Target operation wrapped in ONE hard end-to-end deadline of 2.0s
             async def _do_target_exchange() -> bytes:
                 nonlocal target_contacted
 
-                # Establish TCP connection to target
-                treader, twriter = await asyncio.open_connection(thost, tport)
-                try:
-                    # Connection is now ESTABLISHED
+                # Atomic authority boundary across authorization check, open_connection, and establishment decision
+                async with self._authority_lock:
+                    if not self.is_key_valid(token):
+                        raise PermissionError("Key revoked before target connection")
+
+                    epoch_at_start = self._authority_epoch
+
+                    # Establish TCP connection to target while holding authority lock
+                    treader, twriter = await asyncio.open_connection(thost, tport)
                     target_contacted = True
 
+                try:
+                    # Connection is now ESTABLISHED
                     if self.post_connect_hook is not None:
                         if asyncio.iscoroutinefunction(self.post_connect_hook):
                             await self.post_connect_hook()
