@@ -975,7 +975,7 @@ async def test_dynamic_key_rotation_revocation_replay_and_concurrency():
         assert s1 == 200
 
         # 2. Revoke key v1
-        service.revoke_key(obs_key_v1)
+        await service.revoke_key(obs_key_v1)
 
         # Replay attempt with revoked key v1 must fail 401
         s2, _, body2 = await raw_http_request("127.0.0.1", port, req_v1)
@@ -1128,7 +1128,7 @@ async def test_authority_lock_epoch_revocation_boundary():
     await service.start()
 
     try:
-        service.revoke_key(obs_key)
+        await service.revoke_key(obs_key)
         assert service._authority_epoch > 0
         assert service.is_key_valid(obs_key) is False
 
@@ -1388,7 +1388,7 @@ async def test_http_version_validation():
     try:
         body_str = '{"action_id":"observe.ai_country.health"}'
 
-        # 1. Client sends HTTP/9.9 -> 400 invalid_request
+        # 1. Client sends HTTP/9.9 or malformed version -> 400 invalid_request with fixed message
         req_bad_ver = (
             "POST /v1/observation HTTP/9.9\r\n"
             "Host: 127.0.0.1\r\n"
@@ -1400,7 +1400,26 @@ async def test_http_version_validation():
 
         s1, _, b1 = await raw_http_request("127.0.0.1", port, req_bad_ver)
         assert s1 == 400
-        assert json.loads(b1)["error"]["code"] == "invalid_request"
+        data1 = json.loads(b1.decode("utf-8"))
+        assert data1["error"]["code"] == "invalid_request"
+        assert data1["error"]["message"] == "Unsupported HTTP version"
+
+        # Client sends attacker-controlled version string -> fixed error message with no reflection
+        req_attack_ver = (
+            "POST /v1/observation HTTP/<script>alert(1)</script>\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        s_att, _, b_att = await raw_http_request("127.0.0.1", port, req_attack_ver)
+        assert s_att == 400
+        data_att = json.loads(b_att.decode("utf-8"))
+        assert data_att["error"]["code"] == "invalid_request"
+        assert data_att["error"]["message"] == "Unsupported HTTP version"
+        assert "<script>" not in b_att.decode("utf-8")
 
         # 2. Target sends HTTP/9.9 200 OK -> 502 observation_unavailable
         async def custom_ver_handle(reader, writer):
@@ -1493,7 +1512,7 @@ async def test_revocation_race_no_new_target_connection():
         ).encode("utf-8")
 
         # Revoke key before sending request
-        service.revoke_key(obs_key)
+        await service.revoke_key(obs_key)
 
         s, _, b = await raw_http_request("127.0.0.1", port, req)
         assert s == 401
@@ -1555,7 +1574,8 @@ async def test_target_contacted_audit_distinction():
         await service.stop()
 
 
-def test_code_enforced_capacity_maximums():
+@pytest.mark.asyncio
+async def test_code_enforced_capacity_maximums():
     """Verify operator configuration exceeding code-level maximums (1000) is strictly capped."""
     service = ObservationService(
         log_max_entries=5000,
@@ -1565,13 +1585,142 @@ def test_code_enforced_capacity_maximums():
     assert service.max_revoked_keys == 1000
     assert service.audit_journal.max_entries == 1000
 
-    # Add 1200 revoked keys to verify FIFO eviction cap at 1000
+    # Add 1200 revoked keys to verify capacity cap and saturation
     for i in range(1200):
-        service.revoke_key(f"revoked-key-{i}")
+        await service.revoke_key(f"revoked-key-{i}")
 
-    assert len(service._revoked_keys) == 1000
-    # Oldest 200 keys evicted
-    assert "revoked-key-0" not in service._revoked_keys
-    assert "revoked-key-199" not in service._revoked_keys
-    assert "revoked-key-200" in service._revoked_keys
-    assert "revoked-key-1199" in service._revoked_keys
+    assert len(service._revoked_keys) <= 1000
+    assert service._revocation_saturated is True
+    # Key 0 remains invalid (authority fails closed)
+    assert service.is_key_valid("revoked-key-0") is False
+    assert service.is_key_valid("revoked-key-1199") is False
+
+
+@pytest.mark.asyncio
+async def test_revocation_race_pre_connect_pauses_proves_zero_target_connections():
+    """Verify pausing between authorization and connection initiation, revoking key, proves zero target connections."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-preconnect-race-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+
+    paused_event = asyncio.Event()
+    resume_event = asyncio.Event()
+
+    async def _pre_connect_hook():
+        paused_event.set()
+        await resume_event.wait()
+
+    service.pre_connect_hook = _pre_connect_hook
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        req_task = asyncio.create_task(raw_http_request("127.0.0.1", port, req))
+
+        await asyncio.wait_for(paused_event.wait(), timeout=2.0)
+
+        await service.revoke_key(obs_key)
+
+        resume_event.set()
+
+        status, _, body = await req_task
+        assert status == 401
+        assert json.loads(body)["error"]["code"] == "unauthorized"
+
+        # Prove ZERO target connections / requests were created!
+        assert target.get_count == 0
+        assert target.post_count == 0
+        assert service.audit_journal.entries[-1]["target_contact"] == "false"
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_target_contact_recorded_true_when_post_connect_revocation_occurs():
+    """Verify target_contact=true is recorded when socket establishes even if post-connect revocation aborts GET."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-postconnect-race"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+
+    async def _post_connect_hook():
+        # Revoke key right after TCP socket connects, before sending GET
+        await service.revoke_key(obs_key)
+
+    service.post_connect_hook = _post_connect_hook
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        status, _, body = await raw_http_request("127.0.0.1", port, req)
+        assert status == 401
+        assert json.loads(body)["error"]["code"] == "unauthorized"
+
+        # Target received ZERO GET requests (GET was prevented after connection)
+        assert target.get_count == 0
+
+        # Target socket WAS established, so target_contact MUST be "true"
+        assert service.audit_journal.entries[-1]["target_contact"] == "true"
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_earlier_revoked_key_never_restores_authority_after_capacity_reached():
+    """Verify an earlier revoked key remains invalid forever even after revocation capacity is saturated."""
+    service = ObservationService(max_revoked_keys=10)
+    key_alpha = "revoked-key-alpha-1"
+    key_beta = "revoked-key-beta-2"
+    service._key_override = key_alpha
+
+    # Revoke key_alpha first
+    await service.revoke_key(key_alpha)
+    assert service.is_key_valid(key_alpha) is False
+
+    # Revoke 50 more keys (exceeding capacity of 10)
+    for i in range(50):
+        await service.revoke_key(f"revoked-key-filler-{i}")
+
+    # Verify key_alpha is STILL invalid and did not restore authority!
+    assert service.is_key_valid(key_alpha) is False
+
+    # Verify filler keys are invalid and authority fails closed
+    assert service.is_key_valid("revoked-key-filler-0") is False
+    assert service.is_key_valid(key_beta) is False

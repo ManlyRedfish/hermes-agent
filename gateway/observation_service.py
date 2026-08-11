@@ -170,8 +170,11 @@ class ObservationService:
         )
         self.max_revoked_keys = min(configured_max_revoked, MAX_REVOKED_KEYS)
         self._revoked_keys: OrderedDict[str, bool] = OrderedDict()
+        self._revocation_saturated: bool = False
         self._authority_lock = asyncio.Lock()
         self._authority_epoch = 0
+        self.pre_connect_hook: Optional[Any] = None
+        self.post_connect_hook: Optional[Any] = None
 
         configured_max_logs = (
             log_max_entries
@@ -191,16 +194,22 @@ class ObservationService:
             return self._target_url_override
         return DEFAULT_TARGET_URL
 
-    def revoke_key(self, key: str) -> None:
-        if key:
+    async def revoke_key(self, key: str) -> None:
+        """Revoke a key under authority lock synchronization."""
+        if not key:
+            return
+        async with self._authority_lock:
             if key in self._revoked_keys:
                 del self._revoked_keys[key]
-            self._revoked_keys[key] = True
-            while len(self._revoked_keys) > self.max_revoked_keys:
-                self._revoked_keys.popitem(last=False)
+            if len(self._revoked_keys) < self.max_revoked_keys:
+                self._revoked_keys[key] = True
+            else:
+                self._revocation_saturated = True
             self._authority_epoch += 1
 
     def is_key_valid(self, token: str) -> bool:
+        if self._revocation_saturated:
+            return False
         obs_key = self.get_observation_key()
         if not obs_key:
             return False
@@ -283,7 +292,7 @@ class ObservationService:
 
             # Validate HTTP request version strictly against explicitly supported tokens
             if http_version not in ("HTTP/1.1", "HTTP/1.0"):
-                sc, rb = _json_error("invalid_request", f"Unsupported HTTP version: {http_version}", 400)
+                sc, rb = _json_error("invalid_request", "Unsupported HTTP version", 400)
                 return sc, rb, "unknown", None, None
 
             # Read headers line by line with maximum count and total byte bounds
@@ -476,6 +485,13 @@ class ObservationService:
 
             thost, tport, tpath = target_info
 
+            # Optional test/synchronization hook after authorization and before target connection start
+            if self.pre_connect_hook is not None:
+                if asyncio.iscoroutinefunction(self.pre_connect_hook):
+                    await self.pre_connect_hook()
+                else:
+                    self.pre_connect_hook()
+
             # Protect final revocation check and target connection start with authority lock/epoch
             async with self._authority_lock:
                 epoch_at_start = self._authority_epoch
@@ -490,6 +506,15 @@ class ObservationService:
                 # Establish TCP connection to target
                 treader, twriter = await asyncio.open_connection(thost, tport)
                 try:
+                    # Connection is now ESTABLISHED
+                    target_contacted = True
+
+                    if self.post_connect_hook is not None:
+                        if asyncio.iscoroutinefunction(self.post_connect_hook):
+                            await self.post_connect_hook()
+                        else:
+                            self.post_connect_hook()
+
                     # Validate connected peer address via getpeername before sending any request data
                     sock = twriter.get_extra_info("socket")
                     peer = sock.getpeername() if sock is not None else twriter.get_extra_info("peername")
@@ -503,9 +528,6 @@ class ObservationService:
                     async with self._authority_lock:
                         if self._authority_epoch != epoch_at_start or not self.is_key_valid(token):
                             raise PermissionError("Key revoked during target connection")
-
-                        # Connection is now ESTABLISHED and authority verified!
-                        target_contacted = True
 
                     # Send GET request to target with safe headers only (NO Authorization header!)
                     req_lines = [
