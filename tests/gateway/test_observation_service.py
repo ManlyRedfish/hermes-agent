@@ -1279,6 +1279,299 @@ def test_service_template_egress_and_non_persistence_contract():
     assert "StandardError=null" in content
     assert "ProtectSystem=strict" in content
     assert "ReadWritePaths=" not in content
+    assert "StandardOutput=null" in content
+    assert "StandardError=null" in content
+    assert "ProtectSystem=strict" in content
+    assert "ReadWritePaths=" not in content
     assert "IPAddressAllow=127.0.0.1/32 ::1/128" in content
     assert "IPAddressDeny=any" in content
     assert "Systemd IPAddressAllow is a host-level gate only, NOT exact port isolation" in content
+
+
+@pytest.mark.asyncio
+async def test_request_receive_hard_deadline_timeout():
+    """Verify slow header feeding exceeding aggregate 5s deadline returns 400 invalid_request."""
+    port = get_free_port()
+    obs_key = "obs-key-slow-feed-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+    )
+    await service.start()
+
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"POST /v1/observation HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer obs-key-slow-feed-123\r\n")
+        await writer.drain()
+        # Sleep past aggregate timeout of 5s without finishing request
+        await asyncio.sleep(5.2)
+
+        line = await reader.readline()
+        status_code = 0
+        if line:
+            parts = line.decode("iso-8859-1").split(" ")
+            if len(parts) > 1:
+                status_code = int(parts[1])
+        assert status_code == 400
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_request_header_count_and_byte_limits():
+    """Verify request headers exceeding count (>100) or size (>8192 bytes) return 400 invalid_request."""
+    port = get_free_port()
+    obs_key = "obs-key-hdr-bounds"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+    )
+    await service.start()
+
+    try:
+        # 1. >100 headers
+        hdr_lines = "".join(f"X-Req-Header-{i}: test-val-{i}\r\n" for i in range(110))
+        req1 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 42\r\n"
+            f"{hdr_lines}\r\n"
+            '{"action_id":"observe.ai_country.health"}'
+        ).encode("utf-8")
+
+        s1, _, b1 = await raw_http_request("127.0.0.1", port, req1)
+        assert s1 == 400
+        assert json.loads(b1)["error"]["code"] == "invalid_request"
+
+        # 2. >8192 header bytes
+        big_hdr = "X-Big-Header: " + ("A" * 9000) + "\r\n"
+        req2 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 42\r\n"
+            f"{big_hdr}\r\n"
+            '{"action_id":"observe.ai_country.health"}'
+        ).encode("utf-8")
+
+        s2, _, b2 = await raw_http_request("127.0.0.1", port, req2)
+        assert s2 == 400
+        assert json.loads(b2)["error"]["code"] == "invalid_request"
+
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_http_version_validation():
+    """Verify HTTP request and target status version validation rejects unexpected version tokens."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-ver-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+
+        # 1. Client sends HTTP/9.9 -> 400 invalid_request
+        req_bad_ver = (
+            "POST /v1/observation HTTP/9.9\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        s1, _, b1 = await raw_http_request("127.0.0.1", port, req_bad_ver)
+        assert s1 == 400
+        assert json.loads(b1)["error"]["code"] == "invalid_request"
+
+        # 2. Target sends HTTP/9.9 200 OK -> 502 observation_unavailable
+        async def custom_ver_handle(reader, writer):
+            line = await reader.readline()
+            if line:
+                resp = b"HTTP/9.9 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n" + b'{"status":"ok"}'
+                writer.write(resp)
+                await writer.drain()
+            writer.close()
+
+        target._handle_client = custom_ver_handle
+        await target.stop()
+        await target.start()
+
+        req_valid = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        s2, _, b2 = await raw_http_request("127.0.0.1", port, req_valid)
+        assert s2 == 502
+        assert json.loads(b2)["error"]["code"] == "observation_unavailable"
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_framing_rejection():
+    """Verify request with both Transfer-Encoding and Content-Length is rejected with 400 invalid_request."""
+    port = get_free_port()
+    obs_key = "obs-key-framing-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        s, _, b = await raw_http_request("127.0.0.1", port, req)
+        assert s == 400
+        assert json.loads(b)["error"]["code"] == "invalid_request"
+
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_revocation_race_no_new_target_connection():
+    """Verify after key revocation wins, no new target connection is established using that authority."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-revrace-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        # Revoke key before sending request
+        service.revoke_key(obs_key)
+
+        s, _, b = await raw_http_request("127.0.0.1", port, req)
+        assert s == 401
+        assert json.loads(b)["error"]["code"] == "unauthorized"
+
+        # Assert target received ZERO connections / requests!
+        assert target.get_count == 0
+        assert target.post_count == 0
+        assert service.audit_journal.entries[-1]["target_contact"] == "false"
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_target_contacted_audit_distinction():
+    """Verify target_contacted distinguishes attempted (connection refused -> false) vs established (200 -> true)."""
+    unused_port = get_free_port()
+
+    port = get_free_port()
+    obs_key = "obs-key-audit-dist"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{unused_port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        # 1. Target port not listening -> Connection refused
+        s1, _, b1 = await raw_http_request("127.0.0.1", port, req)
+        assert s1 == 502
+        assert service.audit_journal.entries[-1]["target_contact"] == "false"
+
+        # 2. Target running -> Connection established
+        target = MockHealthTarget()
+        target.port = unused_port
+        await target.start()
+
+        s2, _, b2 = await raw_http_request("127.0.0.1", port, req)
+        assert s2 == 200
+        assert service.audit_journal.entries[-1]["target_contact"] == "true"
+
+        await target.stop()
+
+    finally:
+        await service.stop()
+
+
+def test_code_enforced_capacity_maximums():
+    """Verify operator configuration exceeding code-level maximums (1000) is strictly capped."""
+    service = ObservationService(
+        log_max_entries=5000,
+        max_revoked_keys=5000,
+    )
+    assert service.max_audit_entries == 1000
+    assert service.max_revoked_keys == 1000
+    assert service.audit_journal.max_entries == 1000
+
+    # Add 1200 revoked keys to verify FIFO eviction cap at 1000
+    for i in range(1200):
+        service.revoke_key(f"revoked-key-{i}")
+
+    assert len(service._revoked_keys) == 1000
+    # Oldest 200 keys evicted
+    assert "revoked-key-0" not in service._revoked_keys
+    assert "revoked-key-199" not in service._revoked_keys
+    assert "revoked-key-200" in service._revoked_keys
+    assert "revoked-key-1199" in service._revoked_keys
