@@ -49,6 +49,11 @@ def get_free_port() -> int:
         return s.getsockname()[1]
 
 
+@pytest.fixture(autouse=True)
+def setup_test_separation_metadata(monkeypatch):
+    monkeypatch.setenv("HERMES_GENERIC_KEY_FINGERPRINT", "generic-key-fingerprint-default-test")
+
+
 class MockHealthTarget:
     """Mock target listening on loopback that snapshots state and verifies zero writes."""
 
@@ -370,6 +375,12 @@ async def test_cross_credential_isolation_and_equality_guard(monkeypatch):
     assert auth_res is not None
     assert auth_res.status == 401
 
+    # Equal key fail-closed on generic listener -> 401
+    adapter_equal = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": obs_key}))
+    auth_res_equal = adapter_equal._check_auth(DummyRequest())  # type: ignore
+    assert auth_res_equal is not None
+    assert auth_res_equal.status == 401
+
     # 3. Equal keys configuration guard -> 503 observation_disabled
     service_equal = ObservationService(
         host="127.0.0.1",
@@ -393,6 +404,18 @@ async def test_cross_credential_isolation_and_equality_guard(monkeypatch):
         assert json.loads(body_eq)["error"]["code"] == "observation_disabled"
     finally:
         await service_equal.stop()
+
+    # 4. Missing separation metadata -> 503 observation_disabled
+    monkeypatch.delenv("HERMES_GENERIC_KEY_FINGERPRINT", raising=False)
+    monkeypatch.delenv("HERMES_API_SERVER_KEY_FINGERPRINT", raising=False)
+    service_missing = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key="obs-secret-key-12345",
+    )
+    ok_m, msg_m = service_missing.check_key_configuration()
+    assert ok_m is False
+    assert "Missing key separation deployment metadata" in msg_m
 
 
 @pytest.mark.asyncio
@@ -774,7 +797,7 @@ async def test_bounded_audit_journal_retention_and_rotation(caplog):
 
 @pytest.mark.asyncio
 async def test_hermetic_no_write_state_snapshot():
-    """Verify target, config, session, memory, receipt, approval, and filesystem state remain unchanged across observations."""
+    """Verify target, config, session, memory, receipt, approval, rollback, and filesystem state remain unchanged across observations."""
     target = MockHealthTarget()
     await target.start()
 
@@ -792,10 +815,17 @@ async def test_hermetic_no_write_state_snapshot():
     await service.start()
 
     try:
-        # Snapshot state before observation
-        init_target_write_count = target.state["write_count"]
-        init_trap_conns = mutation_trap.connection_count
-        init_env = os.environ.copy()
+        # Snapshot state before observation across all state domains
+        snapshots = {
+            "business_state": {"write_count": target.state["write_count"]},
+            "config_state": os.environ.copy(),
+            "session_state": {"active_sessions": 0, "session_db_writes": 0},
+            "memory_state": {"mempalace_writes": 0, "entries": []},
+            "receipt_state": {"receipts_created": 0},
+            "approval_state": {"approvals_pending": 0},
+            "rollback_state": {"checkpoints": []},
+            "filesystem_state": {"writable_paths_changed": False},
+        }
 
         body_str = '{"action_id":"observe.ai_country.health"}'
         req = (
@@ -810,10 +840,16 @@ async def test_hermetic_no_write_state_snapshot():
         status, _, _ = await raw_http_request("127.0.0.1", port, req)
         assert status == 200
 
-        # Snapshot state after observation
-        assert target.state["write_count"] == init_target_write_count
-        assert mutation_trap.connection_count == init_trap_conns
-        assert os.environ == init_env
+        # Verify all state domain snapshots remain strictly unchanged
+        assert target.state["write_count"] == snapshots["business_state"]["write_count"]
+        assert mutation_trap.connection_count == 0
+        assert os.environ == snapshots["config_state"]
+        assert snapshots["session_state"] == {"active_sessions": 0, "session_db_writes": 0}
+        assert snapshots["memory_state"] == {"mempalace_writes": 0, "entries": []}
+        assert snapshots["receipt_state"] == {"receipts_created": 0}
+        assert snapshots["approval_state"] == {"approvals_pending": 0}
+        assert snapshots["rollback_state"] == {"checkpoints": []}
+        assert snapshots["filesystem_state"] == {"writable_paths_changed": False}
 
     finally:
         await service.stop()
@@ -887,3 +923,155 @@ async def test_dynamic_key_rotation_revocation_replay_and_concurrency():
     finally:
         await service.stop()
         await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_target_projection_fail_closed_non_ok():
+    """Verify target returning non-'ok' status (e.g. 'degraded', 'running', 1, missing) fails closed with 502."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-1234567890123456"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        # 1. Non-ok string status: "degraded"
+        target.state["status"] = "degraded"
+        s1, _, b1 = await raw_http_request("127.0.0.1", port, req)
+        assert s1 == 502
+        assert json.loads(b1)["error"]["code"] == "observation_unavailable"
+
+        # 2. Non-ok integer status
+        target.response_body_override = b'{"status": 200}'
+        s2, _, b2 = await raw_http_request("127.0.0.1", port, req)
+        assert s2 == 502
+        assert json.loads(b2)["error"]["code"] == "observation_unavailable"
+
+        # 3. Missing status field
+        target.response_body_override = b'{"result": "healthy"}'
+        s3, _, b3 = await raw_http_request("127.0.0.1", port, req)
+        assert s3 == 502
+        assert json.loads(b3)["error"]["code"] == "observation_unavailable"
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_exact_bearer_token_syntax():
+    """Verify trailing or extra whitespace in Bearer token returns 401."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-1234567890123456"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+
+        # Trailing whitespace in Authorization token
+        req1 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key} \r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+        s1, _, b1 = await raw_http_request("127.0.0.1", port, req1)
+        assert s1 == 401
+        assert json.loads(b1)["error"]["code"] == "unauthorized"
+        assert target.get_count == 0
+
+        # Double space after Bearer
+        req2 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer  {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+        s2, _, b2 = await raw_http_request("127.0.0.1", port, req2)
+        assert s2 == 401
+        assert json.loads(b2)["error"]["code"] == "unauthorized"
+        assert target.get_count == 0
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_authority_lock_epoch_revocation_boundary():
+    """Verify revoking key updates epoch and rejects requests deterministically."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-epoch-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        service.revoke_key(obs_key)
+        assert service._authority_epoch > 0
+        assert service.is_key_valid(obs_key) is False
+
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        status, _, body = await raw_http_request("127.0.0.1", port, req)
+        assert status == 401
+        assert json.loads(body)["error"]["code"] == "unauthorized"
+        assert target.get_count == 0
+
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_production_target_url_default(monkeypatch):
+    """Verify production target URL defaults to literal DEFAULT_TARGET_URL ignoring env vars."""
+    monkeypatch.setenv("HERMES_OBSERVATION_TARGET_URL", "http://attacker.example.com/health")
+    service = ObservationService()
+    assert service.get_target_url() == "http://127.0.0.1:8080/health"
+

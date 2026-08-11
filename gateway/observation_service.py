@@ -18,6 +18,7 @@ Strictly enforces:
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -32,6 +33,12 @@ logger = logging.getLogger("hermes.observation_service")
 # Allowed action ID in V1
 ACTION_ID_HEALTH = "observe.ai_country.health"
 OBSERVATION_IDENTITY = "hermes-observer"
+
+# Fixed production target constants (literal, deployment-owned)
+DEFAULT_TARGET_HOST = "127.0.0.1"
+DEFAULT_TARGET_PORT = 8080
+DEFAULT_TARGET_PATH = "/health"
+DEFAULT_TARGET_URL = f"http://{DEFAULT_TARGET_HOST}:{DEFAULT_TARGET_PORT}{DEFAULT_TARGET_PATH}"
 
 # Bounded limits
 MAX_BODY_BYTES = 256
@@ -123,15 +130,29 @@ class ObservationService:
         observation_key: Optional[str] = None,
         target_url: Optional[str] = None,
         api_server_key: Optional[str] = None,
+        generic_key_fingerprint: Optional[str] = None,
         log_max_entries: Optional[int] = None,
     ):
         self.host = host or os.environ.get("HERMES_OBSERVATION_HOST", "127.0.0.1")
         self.port = int(port or os.environ.get("HERMES_OBSERVATION_PORT", "8643"))
         self._key_override = observation_key
         self._target_url_override = target_url
-        self._api_server_key_override = api_server_key
+        
+        if generic_key_fingerprint is not None:
+            self._generic_key_fingerprint = generic_key_fingerprint.strip()
+        elif api_server_key is not None:
+            self._generic_key_fingerprint = hashlib.sha256(api_server_key.encode("utf-8")).hexdigest()
+        else:
+            env_fp = (
+                os.environ.get("HERMES_GENERIC_KEY_FINGERPRINT", "")
+                or os.environ.get("HERMES_API_SERVER_KEY_FINGERPRINT", "")
+            ).strip()
+            self._generic_key_fingerprint = env_fp if env_fp else None
+
         self.server: Optional[asyncio.AbstractServer] = None
         self._revoked_keys: Set[str] = set()
+        self._authority_lock = asyncio.Lock()
+        self._authority_epoch = 0
         max_logs = (
             log_max_entries
             if log_max_entries is not None
@@ -142,18 +163,17 @@ class ObservationService:
     def get_observation_key(self) -> str:
         if self._key_override is not None:
             return self._key_override
-        return os.environ.get("HERMES_OBSERVATION_KEY", "").strip()
+        return os.environ.get("HERMES_OBSERVATION_KEY", "")
 
     def get_target_url(self) -> str:
         if self._target_url_override is not None:
             return self._target_url_override
-        return os.environ.get(
-            "HERMES_OBSERVATION_TARGET_URL", "http://127.0.0.1:8080/health"
-        ).strip()
+        return DEFAULT_TARGET_URL
 
     def revoke_key(self, key: str) -> None:
         if key:
             self._revoked_keys.add(key)
+            self._authority_epoch += 1
 
     def is_key_valid(self, token: str) -> bool:
         obs_key = self.get_observation_key()
@@ -163,13 +183,24 @@ class ObservationService:
             return False
         return hmac.compare_digest(token.encode("utf-8"), obs_key.encode("utf-8"))
 
-    def check_key_configuration(self, api_server_key: Optional[str] = None) -> Tuple[bool, str]:
+    def check_key_configuration(
+        self, api_server_key: Optional[str] = None, generic_key_fingerprint: Optional[str] = None
+    ) -> Tuple[bool, str]:
         obs_key = self.get_observation_key()
         if not obs_key:
             return False, "HERMES_OBSERVATION_KEY is not configured"
-        api_key = api_server_key or self._api_server_key_override
-        if api_key and hmac.compare_digest(obs_key.encode("utf-8"), api_key.encode("utf-8")):
-            return False, "HERMES_OBSERVATION_KEY equals API_SERVER_KEY"
+
+        obs_fp = hashlib.sha256(obs_key.encode("utf-8")).hexdigest()
+        gen_fp = generic_key_fingerprint or self._generic_key_fingerprint
+        if not gen_fp and api_server_key:
+            gen_fp = hashlib.sha256(api_server_key.encode("utf-8")).hexdigest()
+
+        if not gen_fp:
+            return False, "Missing key separation deployment metadata"
+
+        if hmac.compare_digest(obs_fp.encode("utf-8"), gen_fp.encode("utf-8")):
+            return False, "HERMES_OBSERVATION_KEY equals generic key separation metadata"
+
         return True, "ok"
 
     def validate_target_url(self) -> Tuple[bool, str, int, str]:
@@ -279,17 +310,26 @@ class ObservationService:
                 return
 
             # 1. AUTHENTICATION CHECK (performed before body parsing/target contact)
-            auth_headers = [v for k, v in headers if k.lower() == "authorization"]
-            if len(auth_headers) != 1:
+            raw_auth_entries = [r for r in raw_headers if r[0].lower() == "authorization"]
+            if len(raw_auth_entries) != 1:
                 status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
                 return
 
-            auth_val = auth_headers[0]
-            if not auth_val.startswith("Bearer "):
+            raw_val = raw_auth_entries[0][1]
+            if raw_val.endswith(" ") or raw_val.endswith("\t"):
                 status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
                 return
 
-            token = auth_val[7:].strip()
+            val = raw_val[1:] if raw_val.startswith(" ") else raw_val
+            if not val.startswith("Bearer "):
+                status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
+                return
+
+            token = val[7:]
+            if not token or token != token.strip() or token.startswith(" ") or token.endswith(" ") or "\t" in token:
+                status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
+                return
+
             # Verify observation key configuration & separation
             config_ok, msg = self.check_key_configuration()
             if not config_ok:
@@ -297,9 +337,10 @@ class ObservationService:
                 return
 
             # Verify token equality and revocation status
-            if not self.is_key_valid(token):
-                status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
-                return
+            async with self._authority_lock:
+                if not self.is_key_valid(token):
+                    status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
+                    return
 
             # 2. Content-Type check (application/json with no parameters or surrounding whitespace)
             ct_entries = [r for r in raw_headers if r[0].lower() == "content-type"]
@@ -358,31 +399,56 @@ class ObservationService:
                 status_code, response_body = _json_error("invalid_request", "Unsupported action", 400)
                 return
 
-            # 4. Target transport (bounded GET to literal pinned loopback)
+            # 4. Target transport (bounded GET to literal loopback)
             valid_target, thost, tport, tpath = self.validate_target_url()
             if not valid_target:
                 status_code, response_body = _json_error("observation_disabled", "Observation target is not configured", 503)
                 return
 
-            # Verify token valid state immediately before opening target socket connection
-            if not self.is_key_valid(token):
-                status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
-                return
+            # Protect final revocation check and target connection start with authority lock/epoch
+            async with self._authority_lock:
+                epoch_at_start = self._authority_epoch
+                if not self.is_key_valid(token):
+                    status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
+                    return
 
-            target_contacted = True
-            try:
-                treader, twriter = await asyncio.wait_for(
-                    asyncio.open_connection(thost, tport),
-                    timeout=TARGET_TIMEOUT_SECONDS,
-                )
-            except (asyncio.TimeoutError, TimeoutError) as e:
-                logger.warning("Target connection timed out: %s", type(e).__name__)
-                status_code, response_body = _json_error("observation_unavailable", "Target connection timed out", 502)
-                return
-            except Exception as e:
-                logger.warning("Target connection failed: %s", type(e).__name__)
-                status_code, response_body = _json_error("observation_unavailable", "Target connection failed", 502)
-                return
+                target_contacted = True
+                try:
+                    treader, twriter = await asyncio.wait_for(
+                        asyncio.open_connection(thost, tport),
+                        timeout=TARGET_TIMEOUT_SECONDS,
+                    )
+                except (asyncio.TimeoutError, TimeoutError) as e:
+                    logger.warning("Target connection timed out: %s", type(e).__name__)
+                    status_code, response_body = _json_error("observation_unavailable", "Target connection timed out", 502)
+                    return
+                except Exception as e:
+                    logger.warning("Target connection failed: %s", type(e).__name__)
+                    status_code, response_body = _json_error("observation_unavailable", "Target connection failed", 502)
+                    return
+
+                # Validate connected peer address via getpeername before sending any request data
+                try:
+                    sock = twriter.get_extra_info("socket")
+                    peer = sock.getpeername() if sock is not None else twriter.get_extra_info("peername")
+                    if not peer or not isinstance(peer, (tuple, list)) or len(peer) < 2:
+                        raise ValueError("Invalid peer address")
+                    peer_ip, peer_port = str(peer[0]), int(peer[1])
+                    if peer_ip not in ("127.0.0.1", "::1") or peer_ip != thost or peer_port != tport:
+                        raise ValueError(f"Peer address mismatch: {peer_ip}:{peer_port}")
+                except Exception as pe:
+                    logger.warning("Peer address validation failed: %s", pe)
+                    twriter.close()
+                    await twriter.wait_closed()
+                    status_code, response_body = _json_error("observation_unavailable", "Peer validation failed", 502)
+                    return
+
+                # Re-verify authority epoch and token validity after socket connection before sending data
+                if self._authority_epoch != epoch_at_start or not self.is_key_valid(token):
+                    twriter.close()
+                    await twriter.wait_closed()
+                    status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
+                    return
 
             try:
                 # Send GET request to target with safe headers only (NO Authorization header!)
@@ -471,17 +537,17 @@ class ObservationService:
                     status_code, response_body = _json_error("observation_unavailable", "Target JSON invalid", 502)
                     return
 
-                # Fixed projection only: observed is {"status": "ok"}
-                observed_status = t_json.get("status", "ok")
-                if not isinstance(observed_status, str):
-                    observed_status = "ok"
+                # Target projection must fail closed: require exact allowlisted status string "ok"
+                if t_json.get("status") != "ok":
+                    status_code, response_body = _json_error("observation_unavailable", "Target status is not ok", 502)
+                    return
 
                 success_obj = {
                     "action_id": ACTION_ID_HEALTH,
                     "observation_identity": OBSERVATION_IDENTITY,
                     "mutation_capability": "none",
                     "provenance": "real_observation",
-                    "observed": {"status": observed_status},
+                    "observed": {"status": "ok"},
                     "limitations": [],
                 }
                 status_code = 200

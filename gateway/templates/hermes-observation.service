@@ -11,9 +11,9 @@ Group=hermes-observer
 # Separate Environment & Credential File
 EnvironmentFile=/etc/hermes-observation/env
 # HERMES_OBSERVATION_KEY=obs-secret-token-here
+# HERMES_GENERIC_KEY_FINGERPRINT=sha256-fingerprint-of-generic-api-server-key
 # HERMES_OBSERVATION_HOST=127.0.0.1
 # HERMES_OBSERVATION_PORT=8643
-# HERMES_OBSERVATION_TARGET_URL=http://127.0.0.1:8080/health
 # HERMES_OBSERVATION_LOG_MAX_ENTRIES=1000
 
 ExecStart=/usr/bin/python3 -m gateway.observation_service

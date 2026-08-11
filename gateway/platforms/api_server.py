@@ -1813,7 +1813,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
             obs_key = os.environ.get("HERMES_OBSERVATION_KEY", "").strip()
-            if obs_key and hmac.compare_digest(token.encode(), obs_key.encode()) and obs_key != expected_key:
+            if obs_key and hmac.compare_digest(token.encode(), obs_key.encode()):
                 logger.warning("API server rejected observation key on generic listener")
                 if web is not None:
                     return web.json_response(
