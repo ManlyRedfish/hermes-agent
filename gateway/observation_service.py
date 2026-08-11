@@ -165,11 +165,13 @@ class ObservationService:
             if parsed.scheme != "http":
                 return False, "", 0, ""
             host = parsed.hostname
-            if not host or host not in ("127.0.0.1", "::1", "localhost"):
+            if not host or host not in ("127.0.0.1", "::1"):
                 return False, "", 0, ""
-            port = parsed.port or 80
+            if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
+                return False, "", 0, ""
+            port = parsed.port
             path = parsed.path or "/"
-            if parsed.query or parsed.fragment:
+            if port is None or path != "/health":
                 return False, "", 0, ""
             return True, host, port, path
         except Exception:
@@ -298,20 +300,24 @@ class ObservationService:
 
             # 3. Content-Length & Body size cap (enforced before buffering entire body)
             cl_headers = [v for k, v in headers if k.lower() == "content-length"]
-            if cl_headers:
-                try:
-                    cl = int(cl_headers[0])
-                    if cl > MAX_BODY_BYTES:
-                        status_code, response_body = _json_error("request_too_large", "Payload too large", 413)
-                        return
-                except ValueError:
-                    status_code, response_body = _json_error("invalid_request", "Invalid Content-Length", 400)
+            if len(cl_headers) != 1:
+                status_code, response_body = _json_error("invalid_request", "Content-Length required", 400)
+                return
+            try:
+                cl = int(cl_headers[0])
+                if cl < 0:
+                    raise ValueError
+                if cl > MAX_BODY_BYTES:
+                    status_code, response_body = _json_error("request_too_large", "Payload too large", 413)
                     return
+            except ValueError:
+                status_code, response_body = _json_error("invalid_request", "Invalid Content-Length", 400)
+                return
 
-            # Read body bytes up to MAX_BODY_BYTES + 1
-            body_bytes = await reader.read(MAX_BODY_BYTES + 1)
-            if len(body_bytes) > MAX_BODY_BYTES:
-                status_code, response_body = _json_error("request_too_large", "Payload too large", 413)
+            try:
+                body_bytes = await reader.readexactly(cl)
+            except asyncio.IncompleteReadError:
+                status_code, response_body = _json_error("invalid_request", "Incomplete request body", 400)
                 return
 
             if not body_bytes:
@@ -332,13 +338,13 @@ class ObservationService:
                 return
 
             if data["action_id"] != ACTION_ID_HEALTH:
-                status_code, response_body = _json_error("invalid_request", f"Unknown action_id: {data['action_id']}", 400)
+                status_code, response_body = _json_error("invalid_request", "Unsupported action", 400)
                 return
 
             # 4. Target transport (bounded GET to literal pinned loopback)
             valid_target, thost, tport, tpath = self.validate_target_url()
             if not valid_target:
-                status_code, response_body = _json_error("observation_disabled", "Target URL invalid or not loopback", 503)
+                status_code, response_body = _json_error("observation_disabled", "Observation target is not configured", 503)
                 return
 
             target_contacted = True

@@ -292,7 +292,6 @@ async def test_cross_credential_isolation_and_equality_guard(monkeypatch):
     # 2. Observation credential on generic Hermes listener -> 401
     monkeypatch.setenv("HERMES_OBSERVATION_KEY", obs_key)
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": api_key}))
-    
     class DummyRequest:
         headers = {"Authorization": f"Bearer {obs_key}"}
 
@@ -636,12 +635,13 @@ async def test_bounded_logging_sanitization(caplog):
 
     try:
         with caplog.at_level(logging.DEBUG):
+            body = '{"action_id":"observe.ai_country.health"}'
             req = (
                 "POST /v1/observation HTTP/1.1\r\n"
                 "Host: 127.0.0.1\r\n"
                 f"Authorization: Bearer {obs_key}\r\n"
                 "Content-Type: application/json\r\n"
-                "Content-Length: 42\r\n"
+                f"Content-Length: {len(body)}\r\n"
                 "Connection: close\r\n\r\n"
                 '{"action_id":"observe.ai_country.health"}'
             ).encode("utf-8")

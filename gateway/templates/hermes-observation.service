@@ -1,6 +1,6 @@
 [Unit]
 Description=Hermes Observation Service V1
-Documentation=file:///tmp/ai-country-observation-contract-v1.md
+Documentation=https://github.com/ManlyRedfish/manlyredfish-ai-country/issues/81
 After=network.target
 
 [Service]
