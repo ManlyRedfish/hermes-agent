@@ -1282,4 +1282,3 @@ def test_service_template_egress_and_non_persistence_contract():
     assert "IPAddressAllow=127.0.0.1/32 ::1/128" in content
     assert "IPAddressDeny=any" in content
     assert "Systemd IPAddressAllow is a host-level gate only, NOT exact port isolation" in content
-
