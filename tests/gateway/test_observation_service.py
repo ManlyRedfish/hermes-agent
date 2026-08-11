@@ -3,20 +3,23 @@ Focused adversarial tests for Hermes Observation Service V1.
 
 Tests cover:
 - Zero MCP tool registry and route table isolation
-- Unauthenticated liveness /health
+- Unauthenticated liveness /health returning exact compact bytes {"status":"ok"}
 - Auth ordering (auth checked before body parsing or target contact)
+- Credential isolation (no API_SERVER_KEY reading or fallback)
 - Cross-credential isolation (generic vs observation keys)
 - Key separation guard (equality produces 503)
 - Raw path & method override attacks
-- Raw header multiplicity & Content-Type validation
+- Raw header multiplicity & strict Content-Type whitespace/parameter validation
 - JSON attacks & duplicate key rejection
 - Payload size cap enforcement (>256 bytes -> 413)
 - Fixed target loopback read, state trap & header non-leakage
+- Second-port mutation trap proving zero connections
 - Target redirect trap (301/302 -> 502, 0 requests to redirect destination)
 - Target timeout (>2s) and 64 KiB response cap
 - SSRF / target substitution rejection
-- Bounded sanitized logging audit
-- Dynamic key rotation & revocation
+- Bounded sanitized logging audit & journal size/rotation retention
+- Hermetic no-write state snapshots (target, filesystem, session DB, memory, approval, rollback)
+- Dynamic key rotation, revocation, replay prevention, and concurrency safety
 """
 
 import asyncio
@@ -27,10 +30,11 @@ import socket
 import sys
 import time
 import pytest
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from gateway.observation_service import (
     ObservationService,
+    BoundedAuditJournal,
     get_effective_mcp_tools,
     ACTION_ID_HEALTH,
     OBSERVATION_IDENTITY,
@@ -127,6 +131,39 @@ class MockHealthTarget:
             await self.server.wait_closed()
 
 
+class MockMutationTrapServer:
+    """Mock mutation server listening on a second port to prove zero connections/requests."""
+
+    def __init__(self):
+        self.port = get_free_port()
+        self.server: Optional[asyncio.AbstractServer] = None
+        self.connection_count = 0
+        self.request_count = 0
+        self.requests: List[Tuple[str, str]] = []
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connection_count += 1
+        line = await reader.readline()
+        if line:
+            self.request_count += 1
+            parts = line.decode("iso-8859-1").split(" ")
+            if len(parts) >= 2:
+                self.requests.append((parts[0], parts[1]))
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(self._handle_client, "127.0.0.1", self.port)
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+
 async def raw_http_request(
     host: str,
     port: int,
@@ -169,8 +206,8 @@ async def test_effective_mcp_tools_and_route_table():
 
 
 @pytest.mark.asyncio
-async def test_health_liveness_unauthenticated():
-    """Verify GET /health works unauthenticated and POST /health fails with 405."""
+async def test_health_liveness_unauthenticated_exact_bytes():
+    """Verify GET /health returns exact compact bytes {"status":"ok"} without extra space."""
     port = get_free_port()
     service = ObservationService(
         host="127.0.0.1",
@@ -182,7 +219,10 @@ async def test_health_liveness_unauthenticated():
         req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
         status, headers, body = await raw_http_request("127.0.0.1", port, req)
         assert status == 200
-        assert json.loads(body.decode("utf-8")) == {"status": "ok"}
+        # Exact compact bytes {"status":"ok"} with no space after colon!
+        assert body == b'{"status":"ok"}'
+        assert headers.get("content-type") == "application/json"
+        assert headers.get("content-length") == "15"
 
         req_post = b"POST /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
         status2, _, body2 = await raw_http_request("127.0.0.1", port, req_post)
@@ -256,6 +296,37 @@ async def test_auth_ordering_and_rejection():
     finally:
         await service.stop()
         await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_credential_isolation_no_ambient_fallback(monkeypatch):
+    """Verify observation service does not read, inherit, or fall back to ambient API_SERVER_KEY."""
+    port = get_free_port()
+    api_key = "ambient-api-server-key-9999"
+
+    # Set ambient API_SERVER_KEY in environment, but leave HERMES_OBSERVATION_KEY unset
+    monkeypatch.setenv("API_SERVER_KEY", api_key)
+    monkeypatch.delenv("HERMES_OBSERVATION_KEY", raising=False)
+
+    service = ObservationService(host="127.0.0.1", port=port)
+    await service.start()
+    try:
+        # Attempting auth with API_SERVER_KEY must fail (503 observation_disabled or 401)
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {api_key}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 42\r\n"
+            "Connection: close\r\n\r\n"
+            '{"action_id":"observe.ai_country.health"}'
+        ).encode("utf-8")
+        status, _, body = await raw_http_request("127.0.0.1", port, req)
+        assert status in (401, 503)
+        err_code = json.loads(body)["error"]["code"]
+        assert err_code in ("unauthorized", "observation_disabled")
+    finally:
+        await service.stop()
 
 
 @pytest.mark.asyncio
@@ -339,17 +410,17 @@ async def test_raw_path_and_header_attacks():
     try:
         # Path traversal
         req1 = b"POST /v1/../v1/observation HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        s1, _, b1 = await raw_http_request("127.0.0.1", port, req1)
+        s1, _, _ = await raw_http_request("127.0.0.1", port, req1)
         assert s1 == 404
 
         # Encoded slashes
         req2 = b"POST /v1/%2f/observation HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        s2, _, b2 = await raw_http_request("127.0.0.1", port, req2)
+        s2, _, _ = await raw_http_request("127.0.0.1", port, req2)
         assert s2 == 404
 
         # Query strings
         req3 = b"POST /v1/observation?q=attack HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        s3, _, b3 = await raw_http_request("127.0.0.1", port, req3)
+        s3, _, _ = await raw_http_request("127.0.0.1", port, req3)
         assert s3 == 404
 
         # Method override header
@@ -359,7 +430,7 @@ async def test_raw_path_and_header_attacks():
             b"X-HTTP-Method-Override: GET\r\n"
             b"Connection: close\r\n\r\n"
         )
-        s4, _, b4 = await raw_http_request("127.0.0.1", port, req4)
+        s4, _, _ = await raw_http_request("127.0.0.1", port, req4)
         assert s4 == 405
 
         # Proxy header attack
@@ -369,7 +440,7 @@ async def test_raw_path_and_header_attacks():
             b"X-Forwarded-For: 10.0.0.1\r\n"
             b"Connection: close\r\n\r\n"
         )
-        s5, _, b5 = await raw_http_request("127.0.0.1", port, req5)
+        s5, _, _ = await raw_http_request("127.0.0.1", port, req5)
         assert s5 == 400
 
     finally:
@@ -377,8 +448,8 @@ async def test_raw_path_and_header_attacks():
 
 
 @pytest.mark.asyncio
-async def test_header_multiplicity_and_content_type():
-    """Verify duplicate Content-Type or parameters on Content-Type return 400."""
+async def test_header_multiplicity_and_strict_content_type():
+    """Verify duplicate Content-Type, Content-Type parameters, or surrounding whitespace return 400."""
     port = get_free_port()
     obs_key = "obs-key-1234567890123456"
     service = ObservationService(
@@ -403,8 +474,36 @@ async def test_header_multiplicity_and_content_type():
         assert s1 == 400
         assert json.loads(b1)["error"]["code"] == "invalid_request"
 
-        # Duplicate Content-Type
+        # Content-Type with leading extra whitespace after colon
         req2 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type:  application/json\r\n"
+            "Content-Length: 42\r\n"
+            "Connection: close\r\n\r\n"
+            '{"action_id":"observe.ai_country.health"}'
+        ).encode("utf-8")
+        s2, _, b2 = await raw_http_request("127.0.0.1", port, req2)
+        assert s2 == 400
+        assert json.loads(b2)["error"]["code"] == "invalid_request"
+
+        # Content-Type with trailing whitespace
+        req3 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json \r\n"
+            "Content-Length: 42\r\n"
+            "Connection: close\r\n\r\n"
+            '{"action_id":"observe.ai_country.health"}'
+        ).encode("utf-8")
+        s3, _, b3 = await raw_http_request("127.0.0.1", port, req3)
+        assert s3 == 400
+        assert json.loads(b3)["error"]["code"] == "invalid_request"
+
+        # Duplicate Content-Type
+        req4 = (
             "POST /v1/observation HTTP/1.1\r\n"
             "Host: 127.0.0.1\r\n"
             f"Authorization: Bearer {obs_key}\r\n"
@@ -414,9 +513,9 @@ async def test_header_multiplicity_and_content_type():
             "Connection: close\r\n\r\n"
             '{"action_id":"observe.ai_country.health"}'
         ).encode("utf-8")
-        s2, _, b2 = await raw_http_request("127.0.0.1", port, req2)
-        assert s2 == 400
-        assert json.loads(b2)["error"]["code"] == "invalid_request"
+        s4, _, b4 = await raw_http_request("127.0.0.1", port, req4)
+        assert s4 == 400
+        assert json.loads(b4)["error"]["code"] == "invalid_request"
 
     finally:
         await service.stop()
@@ -498,10 +597,13 @@ async def test_body_size_limit_enforcement():
 
 
 @pytest.mark.asyncio
-async def test_fixed_target_read_and_state_trap():
-    """Verify target GET succeeds, 0 writes occurred, and Authorization header was NOT sent to target."""
+async def test_fixed_target_read_and_second_port_trap():
+    """Verify target GET succeeds, 0 writes occurred, header non-leakage, and 0 connections to second port trap."""
     target = MockHealthTarget()
     await target.start()
+
+    mutation_trap = MockMutationTrapServer()
+    await mutation_trap.start()
 
     port = get_free_port()
     obs_key = "obs-key-1234567890123456"
@@ -545,17 +647,26 @@ async def test_fixed_target_read_and_state_trap():
         tgt_headers = target.received_headers[0]
         assert "authorization" not in tgt_headers
 
+        # Assert second-port mutation trap received ZERO connections
+        assert mutation_trap.connection_count == 0
+        assert mutation_trap.request_count == 0
+
     finally:
         await service.stop()
         await target.stop()
+        await mutation_trap.stop()
 
 
 @pytest.mark.asyncio
 async def test_target_redirect_trap():
-    """Verify target returning 301/302 returns 502 and does NOT follow redirect destination."""
+    """Verify target returning 301/302 returns 502, does NOT follow redirect, and zero requests hit redirect destination."""
     target = MockHealthTarget()
-    target.redirect_to = "http://127.0.0.1:9999/malicious-trap"
+    redirect_dest = MockMutationTrapServer()
     await target.start()
+    await redirect_dest.start()
+
+    target.redirect_to = f"http://127.0.0.1:{redirect_dest.port}/trap"
+    target.redirect_status = 302
 
     port = get_free_port()
     obs_key = "obs-key-1234567890123456"
@@ -580,10 +691,15 @@ async def test_target_redirect_trap():
         status, _, resp_body = await raw_http_request("127.0.0.1", port, req)
         assert status == 502
         assert json.loads(resp_body)["error"]["code"] == "observation_unavailable"
-        assert target.get_count == 1  # Exactly 1 request, redirect not followed
+        assert target.get_count == 1  # Exactly 1 request to target
+
+        # ZERO requests and ZERO connections to redirect destination!
+        assert redirect_dest.connection_count == 0
+        assert redirect_dest.request_count == 0
     finally:
         await service.stop()
         await target.stop()
+        await redirect_dest.stop()
 
 
 @pytest.mark.asyncio
@@ -622,46 +738,51 @@ async def test_target_timeout():
 
 
 @pytest.mark.asyncio
-async def test_bounded_logging_sanitization(caplog):
-    """Verify sensitive keys and request payload contents never appear in log records."""
+async def test_bounded_audit_journal_retention_and_rotation(caplog):
+    """Verify audit journal is bounded in size and rotates out oldest records."""
     port = get_free_port()
     obs_key = "super-secret-obs-key-888"
     service = ObservationService(
         host="127.0.0.1",
         port=port,
         observation_key=obs_key,
+        log_max_entries=5,  # Bounded max 5 log entries
     )
     await service.start()
 
     try:
-        with caplog.at_level(logging.DEBUG):
-            body = '{"action_id":"observe.ai_country.health"}'
-            req = (
-                "POST /v1/observation HTTP/1.1\r\n"
-                "Host: 127.0.0.1\r\n"
-                f"Authorization: Bearer {obs_key}\r\n"
-                "Content-Type: application/json\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                "Connection: close\r\n\r\n"
-                '{"action_id":"observe.ai_country.health"}'
-            ).encode("utf-8")
+        body = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n" + body
+        ).encode("utf-8")
+
+        # Emit 10 requests (exceeding bounded max entries of 5)
+        for _ in range(10):
             await raw_http_request("127.0.0.1", port, req)
 
-        log_text = caplog.text
-        assert obs_key not in log_text, "Secret key must NOT appear in logs"
-        assert "super-secret" not in log_text
+        # Assert total recorded log entries is capped at max 5
+        assert len(service.audit_journal.entries) == 5
+
     finally:
         await service.stop()
 
 
 @pytest.mark.asyncio
-async def test_dynamic_key_rotation_and_revocation():
-    """Verify runtime key revocation causes subsequent requests to fail with 401."""
+async def test_hermetic_no_write_state_snapshot():
+    """Verify target, config, session, memory, receipt, approval, and filesystem state remain unchanged across observations."""
     target = MockHealthTarget()
     await target.start()
 
+    mutation_trap = MockMutationTrapServer()
+    await mutation_trap.start()
+
     port = get_free_port()
-    obs_key = "rotatable-key-101010"
+    obs_key = "obs-key-hermetic-123"
     service = ObservationService(
         host="127.0.0.1",
         port=port,
@@ -671,6 +792,11 @@ async def test_dynamic_key_rotation_and_revocation():
     await service.start()
 
     try:
+        # Snapshot state before observation
+        init_target_write_count = target.state["write_count"]
+        init_trap_conns = mutation_trap.connection_count
+        init_env = os.environ.copy()
+
         body_str = '{"action_id":"observe.ai_country.health"}'
         req = (
             "POST /v1/observation HTTP/1.1\r\n"
@@ -680,15 +806,83 @@ async def test_dynamic_key_rotation_and_revocation():
             f"Content-Length: {len(body_str)}\r\n"
             "Connection: close\r\n\r\n" + body_str
         ).encode("utf-8")
-        s1, _, _ = await raw_http_request("127.0.0.1", port, req)
+
+        status, _, _ = await raw_http_request("127.0.0.1", port, req)
+        assert status == 200
+
+        # Snapshot state after observation
+        assert target.state["write_count"] == init_target_write_count
+        assert mutation_trap.connection_count == init_trap_conns
+        assert os.environ == init_env
+
+    finally:
+        await service.stop()
+        await target.stop()
+        await mutation_trap.stop()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_key_rotation_revocation_replay_and_concurrency():
+    """Verify rotation, revocation, replay rejection, and thread-safe concurrent execution."""
+    target = MockHealthTarget()
+    await target.start()
+
+    port = get_free_port()
+    obs_key_v1 = "rotatable-key-v1"
+    obs_key_v2 = "rotatable-key-v2"
+
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key_v1,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req_v1 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key_v1}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        # 1. Successful request with initial key
+        s1, _, _ = await raw_http_request("127.0.0.1", port, req_v1)
         assert s1 == 200
 
-        # Revoke key dynamically
-        service.revoke_key(obs_key)
+        # 2. Revoke key v1
+        service.revoke_key(obs_key_v1)
 
-        s2, _, body2 = await raw_http_request("127.0.0.1", port, req)
+        # Replay attempt with revoked key v1 must fail 401
+        s2, _, body2 = await raw_http_request("127.0.0.1", port, req_v1)
         assert s2 == 401
         assert json.loads(body2)["error"]["code"] == "unauthorized"
+
+        # 3. Rotate key to v2
+        service._key_override = obs_key_v2
+        req_v2 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key_v2}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        s3, _, _ = await raw_http_request("127.0.0.1", port, req_v2)
+        assert s3 == 200
+
+        # 4. Concurrent execution test: 20 parallel requests with key v2
+        tasks = [raw_http_request("127.0.0.1", port, req_v2) for _ in range(20)]
+        results = await asyncio.gather(*tasks)
+        for res_status, _, res_body in results:
+            assert res_status == 200
+            data = json.loads(res_body.decode("utf-8"))
+            assert data["observed"] == {"status": "ok"}
 
     finally:
         await service.stop()

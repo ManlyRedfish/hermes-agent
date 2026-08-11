@@ -64,22 +64,34 @@ def _json_error(code: str, message: str, status_code: int) -> Tuple[int, bytes]:
     return status_code, body
 
 
-def _audit_log(
-    action: str,
-    outcome_code: int,
-    target_contact: bool,
-) -> None:
-    # Bounded sanitized audit record — no credentials, request bodies, headers,
-    # target bodies, paths, or attacker-controlled text logged.
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    logger.info(
-        "AUDIT timestamp=%s identity=%s action=%s outcome=%d target_contact=%s",
-        ts,
-        OBSERVATION_IDENTITY,
-        action,
-        outcome_code,
-        "true" if target_contact else "false",
-    )
+class BoundedAuditJournal:
+    """Bounded, sanitized audit log journal with deterministic max capacity and rotation."""
+
+    def __init__(self, max_entries: int = 1000):
+        self.max_entries = max_entries
+        self.entries: List[Dict[str, Any]] = []
+
+    def record(self, action: str, outcome_code: int, target_contact: bool) -> Dict[str, Any]:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        entry = {
+            "timestamp": ts,
+            "identity": OBSERVATION_IDENTITY,
+            "action": action,
+            "outcome": outcome_code,
+            "target_contact": "true" if target_contact else "false",
+        }
+        self.entries.append(entry)
+        if len(self.entries) > self.max_entries:
+            self.entries.pop(0)
+        logger.info(
+            "AUDIT timestamp=%s identity=%s action=%s outcome=%d target_contact=%s",
+            ts,
+            OBSERVATION_IDENTITY,
+            action,
+            outcome_code,
+            "true" if target_contact else "false",
+        )
+        return entry
 
 
 def _parse_json_no_duplicates(text: str) -> Dict[str, Any]:
@@ -111,6 +123,7 @@ class ObservationService:
         observation_key: Optional[str] = None,
         target_url: Optional[str] = None,
         api_server_key: Optional[str] = None,
+        log_max_entries: Optional[int] = None,
     ):
         self.host = host or os.environ.get("HERMES_OBSERVATION_HOST", "127.0.0.1")
         self.port = int(port or os.environ.get("HERMES_OBSERVATION_PORT", "8643"))
@@ -119,16 +132,17 @@ class ObservationService:
         self._api_server_key_override = api_server_key
         self.server: Optional[asyncio.AbstractServer] = None
         self._revoked_keys: Set[str] = set()
+        max_logs = (
+            log_max_entries
+            if log_max_entries is not None
+            else int(os.environ.get("HERMES_OBSERVATION_LOG_MAX_ENTRIES", "1000"))
+        )
+        self.audit_journal = BoundedAuditJournal(max_entries=max_logs)
 
     def get_observation_key(self) -> str:
         if self._key_override is not None:
             return self._key_override
         return os.environ.get("HERMES_OBSERVATION_KEY", "").strip()
-
-    def get_api_server_key(self) -> str:
-        if self._api_server_key_override is not None:
-            return self._api_server_key_override
-        return os.environ.get("API_SERVER_KEY", "").strip()
 
     def get_target_url(self) -> str:
         if self._target_url_override is not None:
@@ -149,11 +163,11 @@ class ObservationService:
             return False
         return hmac.compare_digest(token.encode("utf-8"), obs_key.encode("utf-8"))
 
-    def check_key_configuration(self) -> Tuple[bool, str]:
+    def check_key_configuration(self, api_server_key: Optional[str] = None) -> Tuple[bool, str]:
         obs_key = self.get_observation_key()
         if not obs_key:
             return False, "HERMES_OBSERVATION_KEY is not configured"
-        api_key = self.get_api_server_key()
+        api_key = api_server_key or self._api_server_key_override
         if api_key and hmac.compare_digest(obs_key.encode("utf-8"), api_key.encode("utf-8")):
             return False, "HERMES_OBSERVATION_KEY equals API_SERVER_KEY"
         return True, "ok"
@@ -216,6 +230,7 @@ class ObservationService:
 
             # Read headers line by line
             headers: List[Tuple[str, str]] = []
+            raw_headers: List[Tuple[str, str, str]] = []  # (key, raw_val, stripped_val)
             while True:
                 try:
                     hline = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -230,6 +245,7 @@ class ObservationService:
                     return
                 k, v = hstr.split(":", 1)
                 headers.append((k.strip(), v.strip()))
+                raw_headers.append((k.strip(), v, v.strip()))
 
             # Check for forbidden override/proxy headers
             for k, _ in headers:
@@ -253,7 +269,7 @@ class ObservationService:
                     status_code, response_body = _json_error("method_not_allowed", "Method not allowed", 405)
                     return
                 status_code = 200
-                response_body = json.dumps({"status": "ok"}).encode("utf-8")
+                response_body = b'{"status":"ok"}'
                 return
 
             # Observation action route: POST /v1/observation
@@ -280,21 +296,22 @@ class ObservationService:
                 status_code, response_body = _json_error("observation_disabled", msg, 503)
                 return
 
-            # Verify token equality
+            # Verify token equality and revocation status
             if not self.is_key_valid(token):
                 status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
                 return
 
-            # 2. Content-Type check (application/json with no parameters)
-            ct_headers = [v for k, v in headers if k.lower() == "content-type"]
-            if len(ct_headers) != 1:
+            # 2. Content-Type check (application/json with no parameters or surrounding whitespace)
+            ct_entries = [r for r in raw_headers if r[0].lower() == "content-type"]
+            if len(ct_entries) != 1:
                 status_code, response_body = _json_error("invalid_request", "Invalid Content-Type header", 400)
                 return
 
-            ct_val = ct_headers[0]
-            if ct_val.lower() != "application/json":
+            _k, raw_v, stripped_v = ct_entries[0]
+            media_type_raw = raw_v[1:] if raw_v.startswith(" ") else raw_v
+            if media_type_raw != media_type_raw.strip() or stripped_v.lower() != "application/json":
                 status_code, response_body = _json_error(
-                    "invalid_request", "Content-Type must be application/json with no parameters", 400
+                    "invalid_request", "Content-Type must be application/json with no parameters or surrounding whitespace", 400
                 )
                 return
 
@@ -345,6 +362,11 @@ class ObservationService:
             valid_target, thost, tport, tpath = self.validate_target_url()
             if not valid_target:
                 status_code, response_body = _json_error("observation_disabled", "Observation target is not configured", 503)
+                return
+
+            # Verify token valid state immediately before opening target socket connection
+            if not self.is_key_valid(token):
+                status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
                 return
 
             target_contacted = True
@@ -418,8 +440,8 @@ class ObservationService:
                         tk, tv = thstr.split(":", 1)
                         t_headers.append((tk.strip(), tv.strip()))
 
-                # Reject redirects: 301, 302, 303, 307, 308 -> 502 and NO follow-up
-                if t_status in (301, 302, 303, 307, 308):
+                # Reject redirects: 300..399 -> 502 and NO follow-up
+                if 300 <= t_status < 400:
                     logger.warning("Target returned redirect status %d", t_status)
                     status_code, response_body = _json_error("observation_unavailable", "Target returned redirect", 502)
                     return
@@ -477,7 +499,7 @@ class ObservationService:
             status_code, response_body = _json_error("observation_unavailable", "Internal error", 500)
 
         finally:
-            _audit_log(action_name, status_code, target_contacted)
+            self.audit_journal.record(action_name, status_code, target_contacted)
             status_text = "OK" if status_code == 200 else "Error"
             resp_lines = [
                 f"HTTP/1.1 {status_code} {status_text}",
