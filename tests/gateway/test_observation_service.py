@@ -30,7 +30,7 @@ import socket
 import sys
 import time
 import pytest
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 
 from gateway.observation_service import (
     ObservationService,
@@ -796,13 +796,61 @@ async def test_bounded_audit_journal_retention_and_rotation(caplog):
 
 
 @pytest.mark.asyncio
-async def test_hermetic_no_write_state_snapshot():
-    """Verify target, config, session, memory, receipt, approval, rollback, and filesystem state remain unchanged across observations."""
+async def test_hermetic_no_write_state_snapshot(tmp_path):
+    """Verify target, config, session, memory, receipt, approval, rollback, and filesystem state remain unchanged across success and failed observations."""
     target = MockHealthTarget()
     await target.start()
 
     mutation_trap = MockMutationTrapServer()
     await mutation_trap.start()
+
+    # Create real file stores under tmp_path for named state domains
+    session_dir = tmp_path / "session_store"
+    session_dir.mkdir()
+    (session_dir / "session.db").write_text("initial-session-db-state")
+
+    memory_dir = tmp_path / "memory_store"
+    memory_dir.mkdir()
+    (memory_dir / "mempalace.json").write_text("initial-mempalace-state")
+
+    receipt_dir = tmp_path / "receipt_store"
+    receipt_dir.mkdir()
+    (receipt_dir / "receipt.log").write_text("initial-receipt-state")
+
+    approval_dir = tmp_path / "approval_store"
+    approval_dir.mkdir()
+    (approval_dir / "approval.json").write_text("initial-approval-state")
+
+    rollback_dir = tmp_path / "rollback_store"
+    rollback_dir.mkdir()
+    (rollback_dir / "checkpoint.json").write_text("initial-checkpoint-state")
+
+    watch_dirs = [session_dir, memory_dir, receipt_dir, approval_dir, rollback_dir]
+
+    def _snapshot_domains() -> Dict[str, Any]:
+        fs_snaps = {}
+        for d in watch_dirs:
+            file_map = {}
+            for p in d.rglob("*"):
+                if p.is_file():
+                    st = p.stat()
+                    file_map[str(p.relative_to(d))] = (p.read_bytes(), st.st_size, st.st_mtime_ns)
+            fs_snaps[d.name] = file_map
+
+        return {
+            "business_state": {
+                "write_count": target.state["write_count"],
+                "post_count": target.post_count,
+                "status": target.state["status"],
+            },
+            "config_state": dict(os.environ),
+            "session_state": fs_snaps.get("session_store", {}),
+            "memory_state": fs_snaps.get("memory_store", {}),
+            "receipt_state": fs_snaps.get("receipt_store", {}),
+            "approval_state": fs_snaps.get("approval_store", {}),
+            "rollback_state": fs_snaps.get("rollback_store", {}),
+            "filesystem_state": fs_snaps,
+        }
 
     port = get_free_port()
     obs_key = "obs-key-hermetic-123"
@@ -815,20 +863,12 @@ async def test_hermetic_no_write_state_snapshot():
     await service.start()
 
     try:
-        # Snapshot state before observation across all state domains
-        snapshots = {
-            "business_state": {"write_count": target.state["write_count"]},
-            "config_state": os.environ.copy(),
-            "session_state": {"active_sessions": 0, "session_db_writes": 0},
-            "memory_state": {"mempalace_writes": 0, "entries": []},
-            "receipt_state": {"receipts_created": 0},
-            "approval_state": {"approvals_pending": 0},
-            "rollback_state": {"checkpoints": []},
-            "filesystem_state": {"writable_paths_changed": False},
-        }
-
         body_str = '{"action_id":"observe.ai_country.health"}'
-        req = (
+
+        # 1. SUCCESSFUL OBSERVATION PATH (POST 200)
+        snap_before_succ = _snapshot_domains()
+
+        req_succ = (
             "POST /v1/observation HTTP/1.1\r\n"
             "Host: 127.0.0.1\r\n"
             f"Authorization: Bearer {obs_key}\r\n"
@@ -837,24 +877,68 @@ async def test_hermetic_no_write_state_snapshot():
             "Connection: close\r\n\r\n" + body_str
         ).encode("utf-8")
 
-        status, _, _ = await raw_http_request("127.0.0.1", port, req)
-        assert status == 200
+        status_s, _, _ = await raw_http_request("127.0.0.1", port, req_succ)
+        assert status_s == 200
 
-        # Verify all state domain snapshots remain strictly unchanged
-        assert target.state["write_count"] == snapshots["business_state"]["write_count"]
+        snap_after_succ = _snapshot_domains()
+
+        # Assert all named state domains are strictly equal before and after success
+        assert snap_after_succ["business_state"]["write_count"] == snap_before_succ["business_state"]["write_count"]
+        assert snap_after_succ["business_state"]["post_count"] == 0
+        assert snap_after_succ["config_state"] == snap_before_succ["config_state"]
+        assert snap_after_succ["session_state"] == snap_before_succ["session_state"]
+        assert snap_after_succ["memory_state"] == snap_before_succ["memory_state"]
+        assert snap_after_succ["receipt_state"] == snap_before_succ["receipt_state"]
+        assert snap_after_succ["approval_state"] == snap_before_succ["approval_state"]
+        assert snap_after_succ["rollback_state"] == snap_before_succ["rollback_state"]
+        assert snap_after_succ["filesystem_state"] == snap_before_succ["filesystem_state"]
         assert mutation_trap.connection_count == 0
-        assert os.environ == snapshots["config_state"]
-        assert snapshots["session_state"] == {"active_sessions": 0, "session_db_writes": 0}
-        assert snapshots["memory_state"] == {"mempalace_writes": 0, "entries": []}
-        assert snapshots["receipt_state"] == {"receipts_created": 0}
-        assert snapshots["approval_state"] == {"approvals_pending": 0}
-        assert snapshots["rollback_state"] == {"checkpoints": []}
-        assert snapshots["filesystem_state"] == {"writable_paths_changed": False}
+        assert mutation_trap.request_count == 0
+
+        # 2. FAILED OBSERVATION PATH (POST 401 Unauthorized)
+        snap_before_fail_401 = _snapshot_domains()
+
+        req_fail_401 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer wrong-key-999\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        status_f1, _, _ = await raw_http_request("127.0.0.1", port, req_fail_401)
+        assert status_f1 == 401
+
+        snap_after_fail_401 = _snapshot_domains()
+        assert snap_after_fail_401 == snap_before_fail_401
+        assert mutation_trap.connection_count == 0
+
+        # 3. FAILED OBSERVATION PATH (POST 502 Target Status Fail)
+        target.state["status"] = "degraded"
+        snap_before_fail_502 = _snapshot_domains()
+
+        req_fail_502 = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        status_f2, _, _ = await raw_http_request("127.0.0.1", port, req_fail_502)
+        assert status_f2 == 502
+
+        snap_after_fail_502 = _snapshot_domains()
+        assert snap_after_fail_502 == snap_before_fail_502
+        assert mutation_trap.connection_count == 0
 
     finally:
         await service.stop()
         await target.stop()
         await mutation_trap.stop()
+
 
 
 @pytest.mark.asyncio
@@ -1074,3 +1158,128 @@ async def test_production_target_url_default(monkeypatch):
     monkeypatch.setenv("HERMES_OBSERVATION_TARGET_URL", "http://attacker.example.com/health")
     service = ObservationService()
     assert service.get_target_url() == "http://127.0.0.1:8080/health"
+
+
+@pytest.mark.asyncio
+async def test_target_header_count_and_byte_limit_502():
+    """Verify target sending >100 response headers or >8192 header bytes returns 502 observation_unavailable."""
+    target = MockHealthTarget()
+    await target.start()
+
+    async def custom_hdr_handle(reader, writer):
+        line = await reader.readline()
+        if line:
+            body = b'{"status":"ok"}'
+            hdr_str = "".join(f"X-Custom-Hdr-{i}: test-value-{i}\r\n" for i in range(110))
+            resp = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"{hdr_str}\r\n"
+            ).encode("utf-8") + body
+            writer.write(resp)
+            await writer.drain()
+        writer.close()
+
+    target._handle_client = custom_hdr_handle
+    await target.stop()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-hdr-limit"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        status, _, b = await raw_http_request("127.0.0.1", port, req)
+        assert status == 502
+        assert json.loads(b)["error"]["code"] == "observation_unavailable"
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+@pytest.mark.asyncio
+async def test_single_end_to_end_hard_deadline_502():
+    """Verify target operation enforces one 2.0s end-to-end hard deadline across connection, headers, and body."""
+    target = MockHealthTarget()
+    await target.start()
+
+    async def slow_stream_handle(reader, writer):
+        line = await reader.readline()
+        if line:
+            await asyncio.sleep(1.2)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n")
+            await writer.drain()
+            await asyncio.sleep(1.2)  # Total 2.4s > 2.0s deadline
+            writer.write(b'{"status":"ok"}')
+            await writer.drain()
+        writer.close()
+
+    target._handle_client = slow_stream_handle
+    await target.stop()
+    await target.start()
+
+    port = get_free_port()
+    obs_key = "obs-key-deadline-123"
+    service = ObservationService(
+        host="127.0.0.1",
+        port=port,
+        observation_key=obs_key,
+        target_url=f"http://127.0.0.1:{target.port}/health",
+    )
+    await service.start()
+
+    t_start = time.time()
+    try:
+        body_str = '{"action_id":"observe.ai_country.health"}'
+        req = (
+            "POST /v1/observation HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {obs_key}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Connection: close\r\n\r\n" + body_str
+        ).encode("utf-8")
+
+        status, _, b = await raw_http_request("127.0.0.1", port, req, timeout=5.0)
+        elapsed = time.time() - t_start
+        assert status == 502
+        assert json.loads(b)["error"]["code"] == "observation_unavailable"
+        assert 1.8 <= elapsed <= 3.2
+    finally:
+        await service.stop()
+        await target.stop()
+
+
+def test_service_template_egress_and_non_persistence_contract():
+    """Verify systemd service template enforces non-persistent output, strict read-only filesystem, and host-level egress rule."""
+    template_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "gateway", "templates", "hermes-observation.service"
+    )
+    with open(template_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "StandardOutput=null" in content
+    assert "StandardError=null" in content
+    assert "ProtectSystem=strict" in content
+    assert "ReadWritePaths=" not in content
+    assert "IPAddressAllow=127.0.0.1/32 ::1/128" in content
+    assert "IPAddressDeny=any" in content
+    assert "Systemd IPAddressAllow is a host-level gate only, NOT exact port isolation" in content
+

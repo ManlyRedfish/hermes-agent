@@ -43,6 +43,8 @@ DEFAULT_TARGET_URL = f"http://{DEFAULT_TARGET_HOST}:{DEFAULT_TARGET_PORT}{DEFAUL
 # Bounded limits
 MAX_BODY_BYTES = 256
 MAX_TARGET_RESPONSE_BYTES = 64 * 1024  # 64 KiB
+MAX_TARGET_HEADER_COUNT = 100
+MAX_TARGET_HEADER_BYTES = 8192  # 8 KiB
 TARGET_TIMEOUT_SECONDS = 2.0
 
 # Forbidden override & proxy headers (case-insensitive)
@@ -412,22 +414,12 @@ class ObservationService:
                     return
 
                 target_contacted = True
-                try:
-                    treader, twriter = await asyncio.wait_for(
-                        asyncio.open_connection(thost, tport),
-                        timeout=TARGET_TIMEOUT_SECONDS,
-                    )
-                except (asyncio.TimeoutError, TimeoutError) as e:
-                    logger.warning("Target connection timed out: %s", type(e).__name__)
-                    status_code, response_body = _json_error("observation_unavailable", "Target connection timed out", 502)
-                    return
-                except Exception as e:
-                    logger.warning("Target connection failed: %s", type(e).__name__)
-                    status_code, response_body = _json_error("observation_unavailable", "Target connection failed", 502)
-                    return
 
-                # Validate connected peer address via getpeername before sending any request data
+            # Target operation wrapped in ONE hard end-to-end deadline of 2.0s
+            async def _do_target_exchange() -> bytes:
+                treader, twriter = await asyncio.open_connection(thost, tport)
                 try:
+                    # Validate connected peer address via getpeername before sending any request data
                     sock = twriter.get_extra_info("socket")
                     peer = sock.getpeername() if sock is not None else twriter.get_extra_info("peername")
                     if not peer or not isinstance(peer, (tuple, list)) or len(peer) < 2:
@@ -435,129 +427,122 @@ class ObservationService:
                     peer_ip, peer_port = str(peer[0]), int(peer[1])
                     if peer_ip not in ("127.0.0.1", "::1") or peer_ip != thost or peer_port != tport:
                         raise ValueError(f"Peer address mismatch: {peer_ip}:{peer_port}")
-                except Exception as pe:
-                    logger.warning("Peer address validation failed: %s", pe)
-                    twriter.close()
-                    await twriter.wait_closed()
-                    status_code, response_body = _json_error("observation_unavailable", "Peer validation failed", 502)
-                    return
 
-                # Re-verify authority epoch and token validity after socket connection before sending data
-                if self._authority_epoch != epoch_at_start or not self.is_key_valid(token):
+                    # Re-verify authority epoch and token validity after socket connection before sending data
+                    async with self._authority_lock:
+                        if self._authority_epoch != epoch_at_start or not self.is_key_valid(token):
+                            raise PermissionError("Key revoked during target connection")
+
+                    # Send GET request to target with safe headers only (NO Authorization header!)
+                    req_lines = [
+                        f"GET {tpath} HTTP/1.1",
+                        f"Host: {thost}:{tport}",
+                        "User-Agent: hermes-observer/1.0",
+                        "Accept: application/json",
+                        "Connection: close",
+                        "",
+                        "",
+                    ]
+                    twriter.write("\r\n".join(req_lines).encode("utf-8"))
+                    await twriter.drain()
+
+                    # Read status line
+                    t_status_line = await treader.readline()
+                    if not t_status_line:
+                        raise ValueError("Empty target response")
+
+                    t_parts = t_status_line.decode("iso-8859-1").split(" ")
+                    if len(t_parts) < 2:
+                        raise ValueError("Invalid target status line")
+
+                    try:
+                        t_status = int(t_parts[1])
+                    except ValueError:
+                        raise ValueError("Invalid target status code")
+
+                    # Read target response headers with header count & total header byte bounds
+                    header_count = 0
+                    header_bytes = 0
+                    t_headers: List[Tuple[str, str]] = []
+                    while True:
+                        thline = await treader.readline()
+                        if not thline:
+                            break
+                        header_bytes += len(thline)
+                        if header_bytes > MAX_TARGET_HEADER_BYTES:
+                            raise ValueError("Target response headers exceeded byte limit")
+
+                        if thline in (b"\r\n", b"\n"):
+                            break
+
+                        header_count += 1
+                        if header_count > MAX_TARGET_HEADER_COUNT:
+                            raise ValueError("Target response header count exceeded limit")
+
+                        thstr = thline.decode("iso-8859-1").rstrip("\r\n")
+                        if ":" in thstr:
+                            tk, tv = thstr.split(":", 1)
+                            t_headers.append((tk.strip(), tv.strip()))
+
+                    # Reject redirects: 300..399 -> 502 and NO follow-up
+                    if 300 <= t_status < 400:
+                        raise ValueError(f"Target returned redirect status {t_status}")
+
+                    if t_status != 200:
+                        raise ValueError(f"Target returned HTTP status {t_status}")
+
+                    # Read target body (max MAX_TARGET_RESPONSE_BYTES)
+                    t_body = await treader.read(MAX_TARGET_RESPONSE_BYTES + 1)
+                    if len(t_body) > MAX_TARGET_RESPONSE_BYTES:
+                        raise ValueError("Target response payload exceeded byte limit")
+
+                    return t_body
+
+                finally:
                     twriter.close()
-                    await twriter.wait_closed()
-                    status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
-                    return
+                    try:
+                        await twriter.wait_closed()
+                    except Exception:
+                        pass
 
             try:
-                # Send GET request to target with safe headers only (NO Authorization header!)
-                req_lines = [
-                    f"GET {tpath} HTTP/1.1",
-                    f"Host: {thost}:{tport}",
-                    "User-Agent: hermes-observer/1.0",
-                    "Accept: application/json",
-                    "Connection: close",
-                    "",
-                    "",
-                ]
-                twriter.write("\r\n".join(req_lines).encode("utf-8"))
-                await twriter.drain()
+                t_body = await asyncio.wait_for(_do_target_exchange(), timeout=TARGET_TIMEOUT_SECONDS)
+            except PermissionError:
+                status_code, response_body = _json_error("unauthorized", "Unauthorized", 401)
+                return
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning("Target operation timed out after %.1fs", TARGET_TIMEOUT_SECONDS)
+                status_code, response_body = _json_error("observation_unavailable", "Target operation timed out", 502)
+                return
+            except Exception as te:
+                logger.warning("Target operation failed: %s", te)
+                status_code, response_body = _json_error("observation_unavailable", "Target operation failed", 502)
+                return
 
-                # Read response status line
-                try:
-                    t_status_line = await asyncio.wait_for(
-                        treader.readline(), timeout=TARGET_TIMEOUT_SECONDS
-                    )
-                except (asyncio.TimeoutError, TimeoutError):
-                    status_code, response_body = _json_error("observation_unavailable", "Target read timed out", 502)
-                    return
+            try:
+                t_json = json.loads(t_body.decode("utf-8"))
+                if not isinstance(t_json, dict):
+                    raise ValueError("Target JSON must be object")
+            except Exception:
+                status_code, response_body = _json_error("observation_unavailable", "Target JSON invalid", 502)
+                return
 
-                if not t_status_line:
-                    status_code, response_body = _json_error("observation_unavailable", "Empty target response", 502)
-                    return
+            # Target projection must fail closed: require exact allowlisted status string "ok"
+            if t_json.get("status") != "ok":
+                status_code, response_body = _json_error("observation_unavailable", "Target status is not ok", 502)
+                return
 
-                t_parts = t_status_line.decode("iso-8859-1").split(" ")
-                if len(t_parts) < 2:
-                    status_code, response_body = _json_error("observation_unavailable", "Invalid target status line", 502)
-                    return
+            success_obj = {
+                "action_id": ACTION_ID_HEALTH,
+                "observation_identity": OBSERVATION_IDENTITY,
+                "mutation_capability": "none",
+                "provenance": "real_observation",
+                "observed": {"status": "ok"},
+                "limitations": [],
+            }
+            status_code = 200
+            response_body = json.dumps(success_obj, separators=(",", ":")).encode("utf-8")
 
-                try:
-                    t_status = int(t_parts[1])
-                except ValueError:
-                    status_code, response_body = _json_error("observation_unavailable", "Invalid target status code", 502)
-                    return
-
-                # Read target headers
-                t_headers: List[Tuple[str, str]] = []
-                while True:
-                    try:
-                        thline = await asyncio.wait_for(
-                            treader.readline(), timeout=TARGET_TIMEOUT_SECONDS
-                        )
-                    except (asyncio.TimeoutError, TimeoutError):
-                        status_code, response_body = _json_error("observation_unavailable", "Target read timed out", 502)
-                        return
-
-                    if not thline or thline in (b"\r\n", b"\n"):
-                        break
-                    thstr = thline.decode("iso-8859-1").rstrip("\r\n")
-                    if ":" in thstr:
-                        tk, tv = thstr.split(":", 1)
-                        t_headers.append((tk.strip(), tv.strip()))
-
-                # Reject redirects: 300..399 -> 502 and NO follow-up
-                if 300 <= t_status < 400:
-                    logger.warning("Target returned redirect status %d", t_status)
-                    status_code, response_body = _json_error("observation_unavailable", "Target returned redirect", 502)
-                    return
-
-                if t_status != 200:
-                    status_code, response_body = _json_error("observation_unavailable", f"Target returned HTTP {t_status}", 502)
-                    return
-
-                # Read target body (max MAX_TARGET_RESPONSE_BYTES)
-                try:
-                    t_body = await asyncio.wait_for(
-                        treader.read(MAX_TARGET_RESPONSE_BYTES + 1),
-                        timeout=TARGET_TIMEOUT_SECONDS,
-                    )
-                except (asyncio.TimeoutError, TimeoutError):
-                    status_code, response_body = _json_error("observation_unavailable", "Target read timed out", 502)
-                    return
-                if len(t_body) > MAX_TARGET_RESPONSE_BYTES:
-                    status_code, response_body = _json_error("observation_unavailable", "Target response too large", 502)
-                    return
-
-                try:
-                    t_json = json.loads(t_body.decode("utf-8"))
-                    if not isinstance(t_json, dict):
-                        raise ValueError("Target JSON must be object")
-                except Exception:
-                    status_code, response_body = _json_error("observation_unavailable", "Target JSON invalid", 502)
-                    return
-
-                # Target projection must fail closed: require exact allowlisted status string "ok"
-                if t_json.get("status") != "ok":
-                    status_code, response_body = _json_error("observation_unavailable", "Target status is not ok", 502)
-                    return
-
-                success_obj = {
-                    "action_id": ACTION_ID_HEALTH,
-                    "observation_identity": OBSERVATION_IDENTITY,
-                    "mutation_capability": "none",
-                    "provenance": "real_observation",
-                    "observed": {"status": "ok"},
-                    "limitations": [],
-                }
-                status_code = 200
-                response_body = json.dumps(success_obj, separators=(",", ":")).encode("utf-8")
-
-            finally:
-                twriter.close()
-                try:
-                    await twriter.wait_closed()
-                except Exception:
-                    pass
 
         except Exception as ex:
             logger.error("Unhandled observation service error: %s", type(ex).__name__)
