@@ -4474,8 +4474,27 @@ class TurnRunner:
             log_message="agent:step hook scheduling error",
         )
 
+    async def _budget_resume_after_turn(self, session_key: str, platform) -> None:
+        """Mark and schedule one bounded post-cap continuation after this turn exits."""
+        await asyncio.sleep(0.25)
+        try:
+            if self._runner.session_store.mark_resume_pending(session_key, "budget_exhausted"):
+                self._runner._schedule_resume_pending_sessions(platform=platform)
+        except Exception:
+            logger.debug("budget continuation scheduling failed for %s", session_key, exc_info=True)
+
     def _event_callback_sync(self, event_type: str, context: dict) -> None:
         ctx = self._ctx
+        if event_type == "agent:budget_exhausted":
+            try:
+                safe_schedule_threadsafe(
+                    self._budget_resume_after_turn(ctx.session_key, ctx.source.platform),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="budget continuation scheduling error",
+                )
+            except Exception:
+                logger.debug("budget continuation callback failed", exc_info=True)
         try:
             asyncio.run_coroutine_threadsafe(
                 ctx._hooks_ref.emit(event_type, context),
@@ -10504,7 +10523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {"restart_timeout", "shutdown_timeout", "restart_interrupted", "budget_exhausted"}
     )
 
     async def _run_startup_resume_event(
