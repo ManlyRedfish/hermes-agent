@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -4112,7 +4113,9 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+        agent._continuation_checkpoint_fingerprint = hashlib.sha256(
+            str(prompt).encode("utf-8", "replace")
+        ).hexdigest()[:24]
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -4270,11 +4273,13 @@ def run_job(
             from agent.budget_continuation import clear as _clear_budget_continuation
             _continuation_started = False
             _continuation_prompt = (
-                "[Internal runtime continuation] Resume this same task from the "
-                "durable checkpoint after the previous run reached its iteration "
-                "limit. Do not repeat completed tool actions or summarize yet; "
-                "execute the next safe action and continue until terminal completion "
-                "or the next runtime boundary."
+                "[Internal runtime continuation] Resume the exact original cron task "
+                "below from the durable checkpoint after the previous run reached "
+                "its iteration limit. Do not reinterpret the task, switch projects, "
+                "or repeat completed tool actions. Execute only the next safe action "
+                "from the original task and continue until terminal completion or "
+                "the next runtime boundary.\n\nOriginal cron task:\n"
+                + str(prompt)
             )
             for _resume_attempt in range(3):
                 _allowed, _resume_count, _guard_reason = _claim_budget_continuation(
