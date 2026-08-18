@@ -4258,6 +4258,64 @@ def run_job(
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
+        # Cron agents do not have a GatewayRunner event callback, so the
+        # finalizer's recoverable budget event cannot reach the gateway resume
+        # scheduler. Handle that runner-owned boundary here: reuse the same
+        # durable session, add an internal auto-continue timeline event, and
+        # start a fresh conversation-loop invocation without delivering the
+        # fallback to the owner. The durable guard was claimed by the
+        # finalizer; subsequent claims bound unchanged-checkpoint churn.
+        if max_iteration_summary:
+            from agent.budget_continuation import claim as _claim_budget_continuation
+            from agent.budget_continuation import clear as _clear_budget_continuation
+            _continuation_started = False
+            _continuation_prompt = (
+                "[Internal runtime continuation] Resume this same task from the "
+                "durable checkpoint after the previous run reached its iteration "
+                "limit. Do not repeat completed tool actions or summarize yet; "
+                "execute the next safe action and continue until terminal completion "
+                "or the next runtime boundary."
+            )
+            for _resume_attempt in range(3):
+                _allowed, _resume_count, _guard_reason = _claim_budget_continuation(
+                    getattr(agent, "session_id", job_id),
+                    str(getattr(agent, "_continuation_checkpoint_fingerprint", "budget_exhausted")),
+                )
+                if not _allowed:
+                    logger.warning(
+                        "Job '%s' budget continuation guard stopped after %s unchanged attempts",
+                        job_name, _resume_count,
+                    )
+                    break
+                logger.warning(
+                    "Job '%s' reached %s; starting internal continuation run (%s)",
+                    job_name, turn_exit_reason, _resume_count,
+                )
+                _continuation_started = True
+                result = agent.run_conversation(
+                    _continuation_prompt,
+                    persist_user_message=_continuation_prompt,
+                    persist_user_display_kind="auto_continue",
+                    persist_user_display_metadata={
+                        "reason": "budget_exhausted",
+                        "continuation_count": _resume_count,
+                    },
+                )
+                if not isinstance(result, dict):
+                    break
+                turn_exit_reason = str(result.get("turn_exit_reason") or "")
+                final_response_text = (result.get("final_response") or "").strip()
+                max_iteration_summary = (
+                    result.get("failed") is not True
+                    and result.get("completed") is False
+                    and turn_exit_reason.startswith("max_iterations_reached(")
+                    and bool(final_response_text)
+                )
+                if not max_iteration_summary:
+                    if _continuation_started:
+                        _clear_budget_continuation(getattr(agent, "session_id", job_id))
+                    break
+
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
                 result.get("error")
