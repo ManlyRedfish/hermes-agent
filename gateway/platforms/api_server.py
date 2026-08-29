@@ -158,6 +158,72 @@ RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
+# Application-facing capability proof surface. This is intentionally a fixed,
+# model-free map rather than a second tool registry or dynamic plugin system.
+class _CapabilityExecutionError(Exception):
+    """Bounded failure from a fixed capability target."""
+
+
+def _mempalace_status_capability(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Call exactly the configured mempalace status tool through Hermes MCP."""
+    from tools.mcp_tool import _make_tool_handler
+
+    raw_result = _make_tool_handler(
+        "mempalace", "mempalace_status", 60.0,
+    )({})
+    try:
+        result = json.loads(raw_result)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise _CapabilityExecutionError("mcp_result_invalid") from exc
+    if isinstance(result, dict) and "error" in result:
+        raise _CapabilityExecutionError("mcp_call_failed")
+    observation = result.get("result") if isinstance(result, dict) else None
+    if isinstance(observation, str):
+        try:
+            observation = json.loads(observation)
+        except json.JSONDecodeError as exc:
+            raise _CapabilityExecutionError("mcp_result_invalid") from exc
+    if not isinstance(observation, dict):
+        raise _CapabilityExecutionError("mcp_result_invalid")
+    wings = observation.get("wings")
+    rooms = observation.get("rooms")
+    total_drawers = observation.get("total_drawers")
+    if (
+        not isinstance(total_drawers, int)
+        or isinstance(total_drawers, bool)  # bool is an int subclass; reject it explicitly
+        or not isinstance(wings, dict)
+        or not isinstance(rooms, dict)
+        or not isinstance(observation.get("backend"), str)
+    ):
+        raise _CapabilityExecutionError("mcp_result_invalid")
+    # vector_disabled is not part of the live MemPalace MCP contract today
+    # (observed absent in captured production payloads); when the field is
+    # missing entirely we report it as unknown rather than failing closed.
+    # If the producer does include the key, it must be a genuine bool —
+    # an explicit null or a wrong-typed value is still a contract violation.
+    response = {
+        "mcp_server": "mempalace",
+        "mcp_tool": "mempalace_status",
+        "total_drawers": total_drawers,
+        "wing_count": len(wings),
+        "room_count": len(rooms),
+        "backend": observation["backend"],
+    }
+    if "vector_disabled" in observation:
+        vector_disabled = observation["vector_disabled"]
+        if not isinstance(vector_disabled, bool):
+            raise _CapabilityExecutionError("mcp_result_invalid")
+        response["vector_disabled"] = vector_disabled
+    return response
+
+
+CAPABILITIES = {
+    "proof.mempalace_status": _mempalace_status_capability,
+}
+_CAPABILITY_REQUEST_FIELDS = frozenset({"capability", "args", "correlation_id"})
+_CAPABILITY_MAX_CORRELATION_LENGTH = 256
+
+
 class ThreadSafeAsyncQueue(asyncio.Queue):
     """An ``asyncio.Queue`` that a non-loop thread can push into safely.
 
@@ -2051,6 +2117,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/capability", self._handle_capability),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -3163,6 +3230,70 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
             },
+        })
+
+    async def _handle_capability(self, request: "web.Request") -> "web.Response":
+        """POST /v1/capability — execute one fixed, model-free capability."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        if (
+            not isinstance(payload, dict)
+            or not {"capability", "args"}.issubset(payload)
+            or not set(payload).issubset(_CAPABILITY_REQUEST_FIELDS)
+        ):
+            return web.json_response({"error": "invalid_request_fields"}, status=400)
+
+        capability = payload.get("capability")
+        args = payload.get("args")
+        correlation_id = payload.get("correlation_id", "")
+        if (
+            not isinstance(capability, str)
+            or not isinstance(args, dict)
+            or not isinstance(correlation_id, str)
+            or len(correlation_id) > _CAPABILITY_MAX_CORRELATION_LENGTH
+        ):
+            return web.json_response({"error": "invalid_capability_schema"}, status=400)
+
+        executor = CAPABILITIES.get(capability)
+        if executor is None:
+            return web.json_response({"error": "unknown_capability"}, status=404)
+
+        if capability == "proof.mempalace_status":
+            args_valid = not args
+        else:  # Keep validation fail-closed if a future entry is added.
+            args_valid = False
+        if not args_valid:
+            return web.json_response({"error": "invalid_capability_schema"}, status=400)
+
+        try:
+            result = executor(args)
+        except _CapabilityExecutionError as exc:
+            return web.json_response({
+                "capability": capability,
+                "executed_capability": capability,
+                "correlation_id": correlation_id,
+                "status": "failed",
+                "model_invoked": False,
+                "error": str(exc),
+            }, status=502)
+        except Exception:
+            logger.exception("Capability execution failed: %s", capability)
+            return web.json_response({"error": "capability_execution_failed"}, status=500)
+
+        return web.json_response({
+            "capability": capability,
+            "executed_capability": capability,
+            "correlation_id": correlation_id,
+            "status": "completed",
+            "model_invoked": False,
+            "result": result,
         })
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
