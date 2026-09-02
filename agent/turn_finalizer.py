@@ -143,6 +143,32 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
+        # Budget exhaustion is a recoverable runtime boundary. Persist a bounded
+        # continuation claim before notifying the gateway; a fresh run may be
+        # scheduled only while the durable no-progress guard allows it.
+        try:
+            from agent.budget_continuation import claim as _claim_budget_continuation
+            _fingerprint = str(getattr(agent, "_continuation_checkpoint_fingerprint", "budget_exhausted"))
+            _allowed, _count, _guard_reason = _claim_budget_continuation(
+                getattr(agent, "session_id", "unknown"), _fingerprint
+            )
+            _event_callback = getattr(agent, "event_callback", None)
+            if callable(_event_callback):
+                _event_callback(
+                    "agent:budget_exhausted" if _allowed else "agent:budget_continuation_guard",
+                    {
+                        "session_id": getattr(agent, "session_id", ""),
+                        "turn_id": turn_id,
+                        "budget_used": api_call_count,
+                        "budget_max": agent.max_iterations,
+                        "continuation_count": _count,
+                        "guard_reason": _guard_reason,
+                    },
+                )
+        except Exception:
+            logger.debug("budget continuation guard/callback failed", exc_info=True)
+
+    if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
@@ -791,6 +817,31 @@ def finalize_turn(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    # Mission checkpoint emission is the final lifecycle side effect before
+    # returning control to the caller. It is a no-op for ordinary sessions.
+    try:
+        from hermes_cli.mission_checkpoint import emit_lifecycle_checkpoint
+        _checkpoint = emit_lifecycle_checkpoint(
+            agent,
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            final_response=final_response,
+            messages=messages,
+            api_call_count=api_call_count,
+            max_iterations=agent.max_iterations,
+            turn_exit_reason=_turn_exit_reason,
+        )
+        if _checkpoint is not None:
+            result["mission_checkpoint"] = {
+                "path": _checkpoint.path,
+                "schema_valid": _checkpoint.schema_valid,
+                "already_present": _checkpoint.already_present,
+            }
+    except Exception as _checkpoint_error:
+        logger.error("mission checkpoint emission failed: %s", _checkpoint_error, exc_info=True)
+        result["mission_checkpoint_error"] = str(_checkpoint_error)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

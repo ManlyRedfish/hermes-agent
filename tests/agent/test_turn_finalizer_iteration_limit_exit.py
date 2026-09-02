@@ -165,6 +165,28 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
+def test_budget_exhaustion_emits_recoverable_continuation_event(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    events = []
+    agent.event_callback = lambda name, payload: events.append((name, payload))
+    result = _finalize(agent, final_response=None, exit_reason="unknown")
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    assert events[0][0] == "agent:budget_exhausted"
+    assert events[0][1]["continuation_count"] == 1
+
+
+def test_budget_continuation_guard_emits_terminal_guard_event(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    events = []
+    agent.event_callback = lambda name, payload: events.append((name, payload))
+    for _ in range(4):
+        _finalize(agent, final_response=None, exit_reason="unknown")
+    assert events[-1][0] == "agent:budget_continuation_guard"
+    assert events[-1][1]["continuation_count"] == 4
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")

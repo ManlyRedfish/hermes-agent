@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ManlyRedfish/hermes-agent/contracts/mission-checkpoint.schema.json",
+  "title": "Hermes Mission Checkpoint",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "parent_mission_id", "child_run_id", "child_outcome",
+    "termination_reason", "forward_progress", "human_escalation_recommended",
+    "observations", "next_gap", "recommended_next_action"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "parent_mission_id": {"type": "string", "minLength": 1},
+    "child_run_id": {"type": "string", "minLength": 1},
+    "child_outcome": {"enum": ["INCOMPLETE", "COMPLETE"]},
+    "termination_reason": {"type": "string", "minLength": 1},
+    "forward_progress": {"type": "boolean"},
+    "human_escalation_recommended": {"type": "boolean"},
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified_facts", "unresolved_gates"],
+      "properties": {
+        "verified_facts": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "unresolved_gates": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "next_gap": {"type": "object"},
+    "recommended_next_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["suggested_capability", "intent"],
+      "properties": {
+        "suggested_capability": {"type": "string", "minLength": 1},
+        "intent": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
