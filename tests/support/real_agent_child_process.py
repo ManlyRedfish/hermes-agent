@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -66,7 +67,10 @@ def main() -> int:
     parser.add_argument("--parent", required=True)
     parser.add_argument("--child", required=True)
     parser.add_argument("--max-iterations", required=True, type=int)
+    parser.add_argument("--delay-seconds", type=float, default=0.0)
     args = parser.parse_args()
+    if args.delay_seconds > 0:
+        time.sleep(args.delay_seconds)
     agent = build_agent(args.checkpoint, args.parent, args.child, args.max_iterations)
     if args.max_iterations == 1:
         agent.client.chat.completions.create.side_effect = [
