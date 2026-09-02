@@ -818,6 +818,31 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    # Mission checkpoint emission is the final lifecycle side effect before
+    # returning control to the caller. It is a no-op for ordinary sessions.
+    try:
+        from hermes_cli.mission_checkpoint import emit_lifecycle_checkpoint
+        _checkpoint = emit_lifecycle_checkpoint(
+            agent,
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            final_response=final_response,
+            messages=messages,
+            api_call_count=api_call_count,
+            max_iterations=agent.max_iterations,
+            turn_exit_reason=_turn_exit_reason,
+        )
+        if _checkpoint is not None:
+            result["mission_checkpoint"] = {
+                "path": _checkpoint.path,
+                "schema_valid": _checkpoint.schema_valid,
+                "already_present": _checkpoint.already_present,
+            }
+    except Exception as _checkpoint_error:
+        logger.error("mission checkpoint emission failed: %s", _checkpoint_error, exc_info=True)
+        result["mission_checkpoint_error"] = str(_checkpoint_error)
+
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 

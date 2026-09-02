@@ -11,6 +11,7 @@ class MissionCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint.json"
             payload = {
+                "schema_version": "1.0",
                 "parent_mission_id": "msn-mempalace-governed-capability",
                 "child_run_id": "run-001",
                 "child_outcome": "INCOMPLETE",
@@ -21,6 +22,7 @@ class MissionCheckpointTests(unittest.TestCase):
                     "verified_facts": ["focused test passed"],
                     "unresolved_gates": ["next bounded repair"],
                 },
+                "next_gap": {"type": "LOCALIZED_CODE_REPAIR"},
                 "recommended_next_action": {
                     "suggested_capability": "repo.repair_and_verify",
                     "intent": "Run the bounded repair and verify tests.",
@@ -36,6 +38,7 @@ class MissionCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint.json"
             payload = {
+                "schema_version": "1.0",
                 "parent_mission_id": "msn-mempalace-governed-capability",
                 "child_run_id": "run-001",
                 "child_outcome": "INCOMPLETE",
@@ -43,6 +46,7 @@ class MissionCheckpointTests(unittest.TestCase):
                 "forward_progress": True,
                 "human_escalation_recommended": False,
                 "observations": {"verified_facts": ["fact"], "unresolved_gates": []},
+                "next_gap": {},
                 "recommended_next_action": {
                     "suggested_capability": "repo.repair_and_verify",
                     "intent": "do work",
