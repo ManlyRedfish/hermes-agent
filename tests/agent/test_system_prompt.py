@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+from agent.prompt_builder import DISCOVERY_ON_MISS_GUIDANCE
 
 
 def _make_agent(**overrides):
@@ -153,6 +154,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        DISCOVERY_ON_MISS_GUIDANCE,
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -182,7 +184,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

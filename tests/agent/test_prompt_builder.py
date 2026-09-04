@@ -28,6 +28,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    DISCOVERY_ON_MISS_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
@@ -54,6 +55,16 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_discovery_on_miss_guidance_requires_bounded_discovery_before_asking(self):
+        text = DISCOVERY_ON_MISS_GUIDANCE.lower()
+        assert "no suitable capability is immediately visible" in text
+        assert "tool_search" in text
+        assert "skills_list" in text
+        assert "terminal" in text
+        assert "before asking" in text
+        assert "semantic fit" in text
+        assert "do not search every tool on every request" in text
 
 
 # =========================================================================

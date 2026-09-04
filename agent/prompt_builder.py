@@ -465,6 +465,25 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "</missing_context>"
 )
 
+# Universal capability-routing guidance. This is deliberately semantic rather
+# than tool-specific: it preserves model freedom while making discovery-on-miss
+# an explicit prerequisite at the shared system-prompt boundary.
+DISCOVERY_ON_MISS_GUIDANCE = (
+    "# Capability discovery on a miss\n"
+    "When the objective clearly requires a semantic capability but no suitable "
+    "capability is immediately visible, do bounded discovery before asking the "
+    "user to identify a tool or declaring the capability unavailable. First check "
+    "the directly visible tools. On a miss, use `tool_search`/`tool_describe` "
+    "when present to inspect relevant deferred capabilities, use `skills_list` "
+    "and `skill_view` when applicable, and inspect terminal-discoverable binaries, "
+    "processes, services, or APIs when the objective concerns the local host. "
+    "Compare candidates by semantic fit, ownership, authority, locality, and "
+    "read/write scope before selecting a path. Do not search every tool on every "
+    "request: discovery is a bounded miss path, not an always-on sweep. Only "
+    "after bounded discovery finds no suitable capability may you ask for "
+    "clarification or report the capability unavailable."
+)
+
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
 GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
