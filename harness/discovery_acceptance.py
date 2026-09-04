@@ -83,7 +83,13 @@ class ScriptedModel:
     """Deterministic policy model: response branch depends on real prompt policy."""
 
     def __init__(self, system_prompt: str, surface: FixtureSurface, trace: Trace):
-        self.policy_enabled = "# Capability discovery on a miss" in system_prompt
+        policy_markers = (
+            "# Capability discovery on a miss",
+            "no suitable capability is immediately visible",
+            "do bounded discovery before asking",
+            "do not search every tool on every request",
+        )
+        self.policy_enabled = all(marker.lower() in system_prompt.lower() for marker in policy_markers)
         self.surface = surface
         self.trace = trace
         self.turn = 0
@@ -197,13 +203,13 @@ def run_scenario(source_root: str, name: str, objective: str, direct: list[Capab
 def assertions(source_root: str) -> dict[str, Any]:
     results: dict[str, Any] = {}
     a = run_scenario(source_root, "direct_hit", "read file", [CAPABILITIES["direct"]], [], [])
-    results["DIRECT_HIT_TEST"] = {"pass": a.index("CAPABILITY_SELECTED") >= 0 and a.index("DEFERRED_DISCOVERY_REQUEST") < 0, "trace": a.events}
+    results["DIRECT_HIT_TEST"] = {"pass": a.index("CAPABILITY_SELECTED") >= 0 and a.index("TOOL_CALL") > a.index("CAPABILITY_SELECTED") and a.index("DEFERRED_DISCOVERY_REQUEST") < 0 and a.index("USER_CLARIFICATION") < 0, "trace": a.events}
     b = run_scenario(source_root, "local_workflow", "run the scheduled declarative workflow", [], [], [CAPABILITIES["workflow"]])
-    results["DAGU_DISCOVERY_TEST"] = {"pass": b.index("LOCAL_DISCOVERY_REQUEST") >= 0 and b.index("CAPABILITY_FOUND") >= 0 and b.index("USER_CLARIFICATION") < 0, "trace": b.events}
+    results["DAGU_DISCOVERY_TEST"] = {"pass": b.index("DIRECT_TOOL_CHECK") >= 0 and b.index("LOCAL_DISCOVERY_REQUEST") > b.index("DIRECT_TOOL_CHECK") and b.index("CAPABILITY_FOUND") > b.index("LOCAL_DISCOVERY_REQUEST") and b.index("CAPABILITY_SELECTED") > b.index("CAPABILITY_FOUND") and b.index("TOOL_CALL") > b.index("CAPABILITY_SELECTED") and b.index("USER_CLARIFICATION") < 0, "trace": b.events}
     c = run_scenario(source_root, "remote_repository", "inspect authoritative pull request build status", [], [CAPABILITIES["repository"]], [])
-    results["DEFERRED_REPOSITORY_TEST"] = {"pass": c.index("DEFERRED_DISCOVERY_REQUEST") >= 0 and c.index("CAPABILITY_SELECTED") >= 0, "trace": c.events}
+    results["DEFERRED_REPOSITORY_TEST"] = {"pass": c.index("DEFERRED_DISCOVERY_REQUEST") >= 0 and c.index("CAPABILITY_FOUND") > c.index("DEFERRED_DISCOVERY_REQUEST") and c.index("CAPABILITY_SELECTED") > c.index("CAPABILITY_FOUND") and c.index("TOOL_CALL") > c.index("CAPABILITY_SELECTED") and c.index("USER_CLARIFICATION") < 0, "trace": c.events}
     d = run_scenario(source_root, "ordinary_mcp", "check my fantasy matchup schedule", [], [CAPABILITIES["mcp"]], [])
-    results["ORDINARY_LANGUAGE_MCP_TEST"] = {"pass": d.index("CAPABILITY_FOUND") >= 0 and d.index("UNAVAILABLE_RESPONSE") < 0, "trace": d.events}
+    results["ORDINARY_LANGUAGE_MCP_TEST"] = {"pass": d.index("DEFERRED_DISCOVERY_REQUEST") >= 0 and d.index("CAPABILITY_FOUND") > d.index("DEFERRED_DISCOVERY_REQUEST") and d.index("CAPABILITY_SELECTED") > d.index("CAPABILITY_FOUND") and d.index("TOOL_CALL") > d.index("CAPABILITY_SELECTED") and d.index("UNAVAILABLE_RESPONSE") < 0, "trace": d.events}
     e = run_scenario(source_root, "absent", "control the imaginary quantum teleporter", [], [], [])
     results["ABSENT_CAPABILITY_TEST"] = {"pass": e.index("DEFERRED_DISCOVERY_REQUEST") >= 0 and e.index("UNAVAILABLE_RESPONSE") >= 0 and e.index("CAPABILITY_SELECTED") < 0, "trace": e.events}
     f = run_scenario(source_root, "ambiguous", "run the scheduled declarative workflow", [], [CAPABILITIES["local_alt"]], [CAPABILITIES["workflow"]])
